@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
+import http from "http";
 import { Address, Transaction, TransactionComputer } from "@multiversx/sdk-core";
 import { Mnemonic, UserSigner } from "@multiversx/sdk-wallet";
 import { Express } from "express";
@@ -23,6 +24,7 @@ import { DEFAULT_MODEL_CATALOG } from "../../src/gateway/model_catalog.js";
 
 describe("BlockRun AI Gateway Proxy Server", () => {
   let app: Express;
+  let server: http.Server;
   let userMnemonic: Mnemonic;
   let userSigner: UserSigner;
   let userAddress: Address;
@@ -92,7 +94,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
     };
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tc = new TransactionComputer();
     broadcastedTxs = [];
     storage = new MemorySettlementStorage();
@@ -146,11 +148,23 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       payTo: merchantAddress.toBech32(),
       rateLimit: { enabled: false },
     });
+
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, "127.0.0.1", () => resolve());
+    });
+  });
+
+  afterEach(async () => {
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
   });
 
   describe("GET /health", () => {
     it("should return healthy gateway status and metadata", async () => {
-      const res = await request(app).get("/health");
+      const res = await request(server).get("/health");
       expect(res.status).toBe(200);
       expect(res.body.status).toBe("ok");
       expect(res.body.version).toBeDefined();
@@ -161,7 +175,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
 
   describe("GET /api/v1/models", () => {
     it("should list available models with context length and token pricing", async () => {
-      const res = await request(app).get("/api/v1/models");
+      const res = await request(server).get("/api/v1/models");
       expect(res.status).toBe(200);
       expect(res.body.object).toBe("list");
       expect(Array.isArray(res.body.data)).toBe(true);
@@ -178,21 +192,21 @@ describe("BlockRun AI Gateway Proxy Server", () => {
 
   describe("POST /api/v1/chat/completions - Input Validation", () => {
     it("should return 400 Bad Request when model or messages are missing", async () => {
-      const res1 = await request(app)
+      const res1 = await request(server)
         .post("/api/v1/chat/completions")
         .send({});
       expect(res1.status).toBe(400);
-      expect(res1.body.error).toContain("model");
+      expect(res1.body?.error || res1.text).toContain("model");
 
-      const res2 = await request(app)
+      const res2 = await request(server)
         .post("/api/v1/chat/completions")
         .send({ model: "openai/gpt-5.4" });
       expect(res2.status).toBe(400);
-      expect(res2.body.error).toContain("messages");
+      expect(res2.body?.error || res2.text).toContain("messages");
     });
 
     it("should return 400 Bad Request when unsupported model is requested", async () => {
-      const res = await request(app)
+      const res = await request(server)
         .post("/api/v1/chat/completions")
         .send({
           model: "unsupported-model-999",
@@ -211,7 +225,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         max_tokens: 500,
       };
 
-      const res = await request(app)
+      const res = await request(server)
         .post("/api/v1/chat/completions")
         .send(reqBody);
 
@@ -257,7 +271,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
   describe("POST /api/v1/chat/completions - Payment Verification Failure", () => {
     it("should reject payment with corrupted signature and return 402 with structured error", async () => {
       // 1. Get challenge requirement
-      const challengeRes = await request(app)
+      const challengeRes = await request(server)
         .post("/api/v1/chat/completions")
         .send({
           model: "deepseek/deepseek-chat",
@@ -271,7 +285,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       const encodedPayload = encodeHeaderJson(corruptedPayload);
 
       // 3. Retry with PAYMENT-SIGNATURE
-      const retryRes = await request(app)
+      const retryRes = await request(server)
         .post("/api/v1/chat/completions")
         .set("PAYMENT-SIGNATURE", encodedPayload)
         .send({
@@ -286,7 +300,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
     });
 
     it("should reject payment with insufficient amount", async () => {
-      const challengeRes = await request(app)
+      const challengeRes = await request(server)
         .post("/api/v1/chat/completions")
         .send({
           model: "openai/gpt-5.4",
@@ -300,7 +314,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       const underpaidPayload = await createPaymentPayload(requirement, { tamperAmount: "1" });
       const encodedPayload = encodeHeaderJson(underpaidPayload);
 
-      const retryRes = await request(app)
+      const retryRes = await request(server)
         .post("/api/v1/chat/completions")
         .set("PAYMENT-SIGNATURE", encodedPayload)
         .send({
@@ -326,7 +340,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       };
 
       // Step 1: Initial request -> 402 Payment Required
-      const challengeRes = await request(app)
+      const challengeRes = await request(server)
         .post("/api/v1/chat/completions")
         .send(reqBody);
 
@@ -338,7 +352,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       const encodedPayload = encodeHeaderJson(validPayload);
 
       // Step 3: Retry request with PAYMENT-SIGNATURE header
-      const completionRes = await request(app)
+      const completionRes = await request(server)
         .post("/api/v1/chat/completions")
         .set("PAYMENT-SIGNATURE", encodedPayload)
         .send(reqBody);
@@ -365,15 +379,16 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         messages: [{ role: "user", content: "Hello DeepSeek!" }],
       };
 
-      const challengeRes = await request(app)
+      const challengeRes = await request(server)
         .post("/api/v1/chat/completions")
         .send(reqBody);
+      expect(challengeRes.status).toBe(402);
       const requirement: PaymentRequirements = challengeRes.body.accepts[0];
 
       const validPayload = await createPaymentPayload(requirement);
       const encodedPayload = encodeHeaderJson(validPayload);
 
-      const res = await request(app)
+      const res = await request(server)
         .post("/api/v1/chat/completions")
         .set("X-Payment", encodedPayload)
         .send(reqBody);
@@ -389,7 +404,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         messages: [{ role: "user", content: "Hello Gemini!" }],
       };
 
-      const challengeRes = await request(app)
+      const challengeRes = await request(server)
         .post("/api/v1/chat/completions")
         .send(reqBody);
       const requirement: PaymentRequirements = challengeRes.body.accepts[0];
@@ -397,7 +412,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       const validPayload = await createPaymentPayload(requirement);
       const encodedPayload = encodeHeaderJson(validPayload);
 
-      const res = await request(app)
+      const res = await request(server)
         .post("/api/v1/chat/completions")
         .set("Authorization", `Bearer ${encodedPayload}`)
         .send(reqBody);
@@ -416,7 +431,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         max_tokens: 500,
       };
 
-      const res = await request(app)
+      const res = await request(server)
         .post("/api/v1/messages")
         .send(reqBody);
 
@@ -434,7 +449,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       };
 
       // 1. Challenge
-      const challengeRes = await request(app)
+      const challengeRes = await request(server)
         .post("/api/v1/messages")
         .send(reqBody);
       expect(challengeRes.status).toBe(402);
@@ -445,7 +460,7 @@ describe("BlockRun AI Gateway Proxy Server", () => {
       const encodedPayload = encodeHeaderJson(validPayload);
 
       // 3. Complete
-      const res = await request(app)
+      const res = await request(server)
         .post("/api/v1/messages")
         .set("PAYMENT-SIGNATURE", encodedPayload)
         .send(reqBody);
@@ -488,23 +503,28 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         }),
       });
 
-      const reqBody = {
-        model: "openai/gpt-5.4",
-        messages: [{ role: "user", content: "Hello upstream!" }],
-      };
+      const customServer = customApp.listen(0, "127.0.0.1");
+      try {
+        const reqBody = {
+          model: "openai/gpt-5.4",
+          messages: [{ role: "user", content: "Hello upstream!" }],
+        };
 
-      const challenge = await request(customApp).post("/api/v1/chat/completions").send(reqBody);
-      const challengeBody = challenge.body?.accepts ? challenge.body : JSON.parse(challenge.text || "{}");
-      const payload = await createPaymentPayload(challengeBody.accepts[0]);
+        const challenge = await request(customServer).post("/api/v1/chat/completions").send(reqBody);
+        expect(challenge.status).toBe(402);
+        const payload = await createPaymentPayload(challenge.body.accepts[0]);
 
-      const res = await request(customApp)
-        .post("/api/v1/chat/completions")
-        .set("PAYMENT-SIGNATURE", encodeHeaderJson(payload))
-        .send(reqBody);
+        const res = await request(customServer)
+          .post("/api/v1/chat/completions")
+          .set("PAYMENT-SIGNATURE", encodeHeaderJson(payload))
+          .send(reqBody);
 
-      expect(res.status).toBe(200);
-      expect(res.body.id).toBe("custom-completion-42");
-      expect(res.body.choices[0].message.content).toBe("Custom Upstream Response 🚀");
+        expect(res.status).toBe(200);
+        expect(res.body.id).toBe("custom-completion-42");
+        expect(res.body.choices[0].message.content).toBe("Custom Upstream Response 🚀");
+      } finally {
+        await new Promise<void>((r) => customServer.close(() => r()));
+      }
     });
 
     it("should timeout if upstreamAiHandler takes longer than upstreamTimeoutMs", async () => {
@@ -513,27 +533,34 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         settlementQueue,
         payTo: merchantAddress.toBech32(),
         upstreamTimeoutMs: 50,
+        rateLimit: { enabled: false },
         upstreamAiHandler: async () => {
           await new Promise((resolve) => setTimeout(resolve, 200));
           return { id: "never-reached" };
         },
       });
 
-      const reqBody = {
-        model: "openai/gpt-5.4",
-        messages: [{ role: "user", content: "Hello slow upstream!" }],
-      };
+      const slowServer = slowApp.listen(0, "127.0.0.1");
+      try {
+        const reqBody = {
+          model: "openai/gpt-5.4",
+          messages: [{ role: "user", content: "Hello slow upstream!" }],
+        };
 
-      const challenge = await request(slowApp).post("/api/v1/chat/completions").send(reqBody);
-      const payload = await createPaymentPayload(challenge.body.accepts[0]);
+        const challenge = await request(slowServer).post("/api/v1/chat/completions").send(reqBody);
+        expect(challenge.status).toBe(402);
+        const payload = await createPaymentPayload(challenge.body.accepts[0]);
 
-      const res = await request(slowApp)
-        .post("/api/v1/chat/completions")
-        .set("PAYMENT-SIGNATURE", encodeHeaderJson(payload))
-        .send(reqBody);
+        const res = await request(slowServer)
+          .post("/api/v1/chat/completions")
+          .set("PAYMENT-SIGNATURE", encodeHeaderJson(payload))
+          .send(reqBody);
 
-      expect(res.status).toBe(504);
-      expect(res.body.error).toContain("timed out");
+        expect(res.status).toBe(504);
+        expect(res.body.error).toContain("timed out");
+      } finally {
+        await new Promise<void>((r) => slowServer.close(() => r()));
+      }
     });
 
     it("should rate limit requests when limit is exceeded", async () => {
@@ -544,15 +571,20 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         rateLimit: { windowMs: 10000, max: 2, enabled: true },
       });
 
-      const res1 = await request(rateLimitedApp).get("/health");
-      expect(res1.status).toBe(200);
+      const rlServer = rateLimitedApp.listen(0, "127.0.0.1");
+      try {
+        const res1 = await request(rlServer).get("/health");
+        expect(res1.status).toBe(200);
 
-      const res2 = await request(rateLimitedApp).get("/health");
-      expect(res2.status).toBe(200);
+        const res2 = await request(rlServer).get("/health");
+        expect(res2.status).toBe(200);
 
-      const res3 = await request(rateLimitedApp).get("/health");
-      expect(res3.status).toBe(429);
-      expect(res3.body.error).toContain("Too many requests");
+        const res3 = await request(rlServer).get("/health");
+        expect(res3.status).toBe(429);
+        expect(res3.body.error).toContain("Too many requests");
+      } finally {
+        await new Promise<void>((r) => rlServer.close(() => r()));
+      }
     });
   });
 });

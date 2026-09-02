@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import request from "supertest";
+import http from "http";
 import { Address, Transaction, TransactionComputer } from "@multiversx/sdk-core";
 import { Mnemonic, UserSigner } from "@multiversx/sdk-wallet";
 import {
@@ -22,6 +23,7 @@ import { Express } from "express";
 
 describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
   let app: Express;
+  let server: http.Server;
   let userMnemonic: Mnemonic;
   let userSigner: UserSigner;
   let userAddress: Address;
@@ -108,7 +110,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
     };
   }
 
-  beforeEach(() => {
+  beforeEach(async () => {
     tc = new TransactionComputer();
     broadcastedTxs = [];
     storage = new MemorySettlementStorage();
@@ -165,11 +167,23 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
       extensions: ["bazaar", "relayed-v3"],
       rateLimit: { enabled: false },
     });
+
+    await new Promise<void>((resolve) => {
+      server = app.listen(0, "127.0.0.1", () => resolve());
+    });
+  });
+
+  afterEach(async () => {
+    if (server) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+    }
   });
 
   describe("GET /health", () => {
     it("should return 200 with status ok, timestamp, version, and queue stats", async () => {
-      const res = await request(app).get("/health");
+      const res = await request(server).get("/health");
       expect(res.status).toBe(200);
       expect(res.body.status).toBe("ok");
       expect(res.body.version).toBe("2.0.0");
@@ -181,7 +195,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
 
   describe("GET /supported", () => {
     it("should return supported kinds, extensions, and signers for networks", async () => {
-      const res = await request(app).get("/supported");
+      const res = await request(server).get("/supported");
       expect(res.status).toBe(200);
       expect(Array.isArray(res.body.kinds)).toBe(true);
       expect(res.body.kinds.length).toBeGreaterThan(0);
@@ -193,7 +207,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
 
   describe("GET /.well-known/x402", () => {
     it("should return complete discovery document with x402 metadata and endpoints", async () => {
-      const res = await request(app).get("/.well-known/x402");
+      const res = await request(server).get("/.well-known/x402");
       expect(res.status).toBe(200);
       expect(res.body.x402Version).toBe(2);
       expect(res.body.name).toBe("BlockRun MultiversX x402 Facilitator Gateway");
@@ -209,22 +223,22 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
   describe("GET /relayer/address/:userAddress", () => {
     it("should return relayer address and shard for a valid user address", async () => {
       const userAddrStr = userAddress.toBech32();
-      const res = await request(app).get(`/relayer/address/${userAddrStr}`);
+      const res = await request(server).get(`/relayer/address/${userAddrStr}`);
       expect(res.status).toBe(200);
       expect(res.body.relayerAddress).toBe(relayerPool.getRelayerAddressForUser(userAddrStr));
       expect(typeof res.body.shard).toBe("number");
     });
 
     it("should return 400 for invalid MultiversX bech32 address", async () => {
-      const res = await request(app).get("/relayer/address/invalid-address-not-bech32");
+      const res = await request(server).get("/relayer/address/invalid-address-not-bech32");
       expect(res.status).toBe(400);
-      expect(res.body.error).toBeDefined();
+      expect(res.text).toContain("Invalid MultiversX address");
     });
   });
 
   describe("GET /relayer/shards", () => {
     it("should return all configured relayer addresses by shard", async () => {
-      const res = await request(app).get("/relayer/shards");
+      const res = await request(server).get("/relayer/shards");
       expect(res.status).toBe(200);
       expect(res.body.relayers).toBeDefined();
       expect(Array.isArray(res.body.shards)).toBe(true);
@@ -240,7 +254,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         paymentRequirements: standardRequirements,
       };
 
-      const res = await request(app).post("/verify").send(verifyReq);
+      const res = await request(server).post("/verify").send(verifyReq);
       expect(res.status).toBe(200);
       expect(res.body.isValid).toBe(true);
       expect(res.body.payer).toBe(userAddress.toBech32());
@@ -258,7 +272,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         paymentRequirements: standardRequirements,
       };
 
-      const res = await request(app).post("/verify").send(verifyReq);
+      const res = await request(server).post("/verify").send(verifyReq);
       expect(res.status).toBe(200);
       expect(res.body.isValid).toBe(false);
       expect(res.body.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
@@ -272,7 +286,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         paymentRequirements: standardRequirements,
       };
 
-      const res = await request(app).post("/verify").send(verifyReq);
+      const res = await request(server).post("/verify").send(verifyReq);
       expect(res.status).toBe(200);
       expect(res.body.isValid).toBe(false);
       expect(res.body.errorCode).toBe(PaymentErrorCode.PAYMENT_EXPIRED);
@@ -282,7 +296,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
       const paymentPayload = await createValidPaymentPayload();
       const encoded = encodeHeaderJson(paymentPayload);
 
-      const res = await request(app)
+      const res = await request(server)
         .post("/verify")
         .set("PAYMENT-SIGNATURE", encoded)
         .send({ paymentRequirements: standardRequirements });
@@ -292,12 +306,12 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
     });
 
     it("should return 400 Bad Request on invalid request schema", async () => {
-      const res = await request(app)
+      const res = await request(server)
         .post("/verify")
         .send({ invalid: "data", missingRequirements: true });
 
       expect(res.status).toBe(400);
-      expect(res.body.error).toBeDefined();
+      expect(res.text).toContain("Invalid verify request");
     });
   });
 
@@ -309,7 +323,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         paymentRequirements: standardRequirements,
       };
 
-      const res = await request(app).post("/settle").send(settleReq);
+      const res = await request(server).post("/settle").send(settleReq);
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.transaction).toBeDefined();
@@ -330,12 +344,12 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         paymentRequirements: standardRequirements,
       };
 
-      const res1 = await request(app).post("/settle").send(settleReq);
+      const res1 = await request(server).post("/settle").send(settleReq);
       expect(res1.status).toBe(200);
       expect(res1.body.success).toBe(true);
       const tx1 = res1.body.transaction;
 
-      const res2 = await request(app).post("/settle").send(settleReq);
+      const res2 = await request(server).post("/settle").send(settleReq);
       expect(res2.status).toBe(200);
       expect(res2.body.success).toBe(true);
       expect(res2.body.transaction).toBe(tx1);
@@ -351,7 +365,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         paymentRequirements: standardRequirements,
       };
 
-      const res = await request(app).post("/settle").send(settleReq);
+      const res = await request(server).post("/settle").send(settleReq);
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(false);
       expect(res.body.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
@@ -363,7 +377,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
       const paymentPayload = await createValidPaymentPayload();
       const encoded = encodeHeaderJson(paymentPayload);
 
-      const res = await request(app)
+      const res = await request(server)
         .post("/settle")
         .set("payment-signature", encoded)
         .send({ paymentRequirements: standardRequirements });
@@ -374,7 +388,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
     });
 
     it("should return 400 Bad Request on invalid request body", async () => {
-      const res = await request(app).post("/settle").send({ foo: "bar" });
+      const res = await request(server).post("/settle").send({ foo: "bar" });
       expect(res.status).toBe(400);
       expect(res.body.error).toBeDefined();
     });
@@ -382,7 +396,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
 
   describe("GET /openapi.json", () => {
     it("should return valid OpenAPI 3.1.0 document with all facilitator endpoints", async () => {
-      const res = await request(app).get("/openapi.json");
+      const res = await request(server).get("/openapi.json");
       expect(res.status).toBe(200);
       expect(res.body.openapi).toBe("3.1.0");
       expect(res.body.info).toBeDefined();
@@ -401,7 +415,7 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
 
   describe("Middleware & Error Handling", () => {
     it("should handle CORS pre-flight OPTIONS request and expose x402 headers", async () => {
-      const res = await request(app)
+      const res = await request(server)
         .options("/settle")
         .set("Origin", "https://app.blockrun.ai")
         .set("Access-Control-Request-Method", "POST");
@@ -411,12 +425,17 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
     });
 
     it("should include security headers from helmet", async () => {
-      const res = await request(app).get("/health");
+      const res = await request(server).get("/health");
       expect(res.headers["x-content-type-options"]).toBe("nosniff");
     });
 
     it("should handle malformed JSON body with structured 400 error", async () => {
-      const res = await request(app)
+      const malformedApp = createFacilitatorServer({
+        verifier,
+        settlementQueue,
+        rateLimit: { enabled: false },
+      });
+      const res = await request(malformedApp)
         .post("/verify")
         .set("Content-Type", "application/json")
         .set("Connection", "close")
@@ -434,15 +453,20 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         rateLimit: { windowMs: 10000, max: 2, enabled: true },
       });
 
-      const res1 = await request(rateLimitedApp).get("/health");
-      expect(res1.status).toBe(200);
+      const rlServer = rateLimitedApp.listen(0, "127.0.0.1");
+      try {
+        const res1 = await request(rlServer).get("/health");
+        expect(res1.status).toBe(200);
 
-      const res2 = await request(rateLimitedApp).get("/health");
-      expect(res2.status).toBe(200);
+        const res2 = await request(rlServer).get("/health");
+        expect(res2.status).toBe(200);
 
-      const res3 = await request(rateLimitedApp).get("/health");
-      expect(res3.status).toBe(429);
-      expect(res3.body.error).toContain("Too many requests");
+        const res3 = await request(rlServer).get("/health");
+        expect(res3.status).toBe(429);
+        expect(res3.body.error).toContain("Too many requests");
+      } finally {
+        await new Promise<void>((r) => rlServer.close(() => r()));
+      }
     });
 
     it("should gracefully handle missing relayer pool for relayer endpoints", async () => {
@@ -452,13 +476,18 @@ describe("Facilitator HTTP Server (x402 v2 Endpoints & OpenAPI)", () => {
         rateLimit: { enabled: false },
       });
 
-      const resShards = await request(noRelayerApp).get("/relayer/shards");
-      expect(resShards.status).toBe(200);
-      expect(resShards.body.shards).toEqual([]);
+      const noRelayerServer = noRelayerApp.listen(0, "127.0.0.1");
+      try {
+        const resShards = await request(noRelayerServer).get("/relayer/shards");
+        expect(resShards.status).toBe(200);
+        expect(resShards.body.shards).toEqual([]);
 
-      const resAddr = await request(noRelayerApp).get(`/relayer/address/${userAddress.toBech32()}`);
-      expect(resAddr.status).toBe(503);
-      expect(resAddr.body.error).toContain("not configured");
+        const resAddr = await request(noRelayerServer).get(`/relayer/address/${userAddress.toBech32()}`);
+        expect(resAddr.status).toBe(503);
+        expect(resAddr.body.error).toContain("not configured");
+      } finally {
+        await new Promise<void>((r) => noRelayerServer.close(() => r()));
+      }
     });
 
     it("should configure trust proxy setting when provided", () => {
