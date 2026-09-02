@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  blockrun-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: blockrun-mvx-gateway
+    restart: unless-stopped
+    ports:
+      - "3000:3000"   # AI Gateway (OpenAI / Anthropic endpoints)
+      - "3402:3402"   # x402 Facilitator (/verify, /settle, discovery)
+    env_file:
+      - .env
+    volumes:
+      - gateway-data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3402/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  gateway-data:
+    driver: local

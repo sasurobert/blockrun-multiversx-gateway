@@ -4,6 +4,20 @@
   "type": "module",
   "description": "x402 v2 Payment Gateway and Facilitator for MultiversX",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/client/blockrun_mvx_client.d.ts",
+      "import": "./dist/client/blockrun_mvx_client.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/bin/server.js",

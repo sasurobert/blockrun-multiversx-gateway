@@ -405,12 +405,20 @@ export class VerifierService implements IVerifierService {
             reasonLower.includes("balance") ||
             reasonLower.includes("unfunded") ||
             reasonLower.includes("insufficient");
+          const isStale =
+            reasonLower.includes("nonce") ||
+            reasonLower.includes("epoch") ||
+            reasonLower.includes("blockhash") ||
+            reasonLower.includes("expired") ||
+            reasonLower.includes("stale");
 
           return {
             isValid: false,
             errorCode: isUnfunded
               ? PaymentErrorCode.PAYMENT_UNFUNDED
-              : PaymentErrorCode.PAYMENT_INVALID,
+              : isStale
+                ? PaymentErrorCode.PAYMENT_BLOCKHASH_STALE
+                : PaymentErrorCode.PAYMENT_INVALID,
             invalidReason: reason,
             payer: txPayload.sender,
           };
