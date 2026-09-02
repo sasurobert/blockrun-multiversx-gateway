@@ -1,0 +1,38 @@
+{
+  "name": "blockrun-multiversx-gateway",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "x402 v2 Payment Gateway and Facilitator for MultiversX",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bin/server.js",
+    "dev": "tsx watch src/bin/server.ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@multiversx/sdk-core": "^15.0.0",
+    "@multiversx/sdk-network-providers": "^2.9.3",
+    "@multiversx/sdk-wallet": "^4.6.0",
+    "better-sqlite3": "^12.6.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "pino": "^9.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.12.12",
+    "@types/supertest": "^6.0.2",
+    "pino-pretty": "^11.0.0",
+    "supertest": "^7.0.0",
+    "tsx": "^4.10.5",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
