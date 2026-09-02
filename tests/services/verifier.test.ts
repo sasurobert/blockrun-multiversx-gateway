@@ -836,5 +836,233 @@ describe("VerifierService (x402 Payment Verification)", () => {
     expect(result.isValid).toBe(false);
     expect(result.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
   });
+
+  it("20. should reject ESDTTransfer with injected smart contract endpoint arguments (SEC-01)", async () => {
+    const asset = "USDC-c76f1f";
+    const amount = "1000000";
+    // Maliciously crafted data: ESDTTransfer@token@amount@drainFunction@arg1@arg2
+    const maliciousData = `ESDTTransfer@${Buffer.from(asset).toString("hex")}@${BigInt(amount).toString(16)}@${Buffer.from("drainVault").toString("hex")}@01`;
+
+    const txPayload = await createSignedTransaction({
+      data: maliciousData,
+      receiver: receiverAddress,
+    });
+
+    const requirements = {
+      scheme: "exact" as const,
+      network: "multiversx:D",
+      asset: asset,
+      amount: amount,
+      payTo: receiverAddress.toBech32(),
+      maxTimeoutSeconds: 60,
+    };
+
+    const verifyReq: VerifyRequest = {
+      paymentPayload: {
+        x402Version: 2,
+        accepted: requirements,
+        payload: txPayload,
+      },
+      paymentRequirements: requirements,
+    };
+
+    const verifier = new VerifierService({ relayerPool });
+    const result = await verifier.verify(verifyReq);
+
+    expect(result.isValid).toBe(false);
+    expect(result.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
+    expect(result.invalidReason).toContain("transfer");
+  });
+
+  it("21. should reject native EGLD transfer with injected contract data (SEC-01)", async () => {
+    const amount = "1000000000000000000";
+    // Malicious contract call data attached to EGLD transfer
+    const maliciousData = "claimRewards@01";
+
+    const txPayload = await createSignedTransaction({
+      value: BigInt(amount),
+      data: maliciousData,
+      receiver: receiverAddress,
+    });
+
+    const requirements = {
+      scheme: "exact" as const,
+      network: "multiversx:D",
+      asset: "EGLD",
+      amount: amount,
+      payTo: receiverAddress.toBech32(),
+      maxTimeoutSeconds: 60,
+    };
+
+    const verifyReq: VerifyRequest = {
+      paymentPayload: {
+        x402Version: 2,
+        accepted: requirements,
+        payload: txPayload,
+      },
+      paymentRequirements: requirements,
+    };
+
+    const verifier = new VerifierService({ relayerPool });
+    const result = await verifier.verify(verifyReq);
+
+    expect(result.isValid).toBe(false);
+    expect(result.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
+  });
+
+  it("22. should reject transaction with gasPrice exceeding MAX_ALLOWED_GAS_PRICE (SEC-02)", async () => {
+    const txPayload = await createSignedTransaction({
+      value: 1000000000000000000n,
+      receiver: receiverAddress,
+      gasPrice: 5000000000n, // 5 Gwei (exceeds 2 Gwei maximum)
+    });
+
+    const requirements = {
+      scheme: "exact" as const,
+      network: "multiversx:D",
+      asset: "EGLD",
+      amount: "1000000000000000000",
+      payTo: receiverAddress.toBech32(),
+      maxTimeoutSeconds: 60,
+    };
+
+    const verifyReq: VerifyRequest = {
+      paymentPayload: {
+        x402Version: 2,
+        accepted: requirements,
+        payload: txPayload,
+      },
+      paymentRequirements: requirements,
+    };
+
+    const verifier = new VerifierService({ relayerPool });
+    const result = await verifier.verify(verifyReq);
+
+    expect(result.isValid).toBe(false);
+    expect(result.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
+    expect(result.invalidReason).toContain("gasPrice");
+  });
+
+  it("23. should reject Relayed V3 transaction with gasLimit exceeding MAX_ALLOWED_RELAYER_GAS_LIMIT (SEC-02)", async () => {
+    const userAddrStr = userSigner.getAddress().bech32();
+    const relayerSigner = relayerPool.getRelayerForAddress(userAddrStr);
+    const relayerAddrStr = relayerSigner.getAddress().bech32();
+
+    const txPayload = await createSignedTransaction({
+      value: 1000000000000000000n,
+      receiver: receiverAddress,
+      relayer: Address.newFromBech32(relayerAddrStr),
+      gasLimit: 5000000n, // 5M gas limit (exceeds 1M maximum for relayer payments)
+    });
+
+    const requirements = {
+      scheme: "exact" as const,
+      network: "multiversx:D",
+      asset: "EGLD",
+      amount: "1000000000000000000",
+      payTo: receiverAddress.toBech32(),
+      maxTimeoutSeconds: 60,
+    };
+
+    const verifyReq: VerifyRequest = {
+      paymentPayload: {
+        x402Version: 2,
+        accepted: requirements,
+        payload: txPayload,
+      },
+      paymentRequirements: requirements,
+    };
+
+    const verifier = new VerifierService({ relayerPool });
+    const result = await verifier.verify(verifyReq);
+
+    expect(result.isValid).toBe(false);
+    expect(result.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
+    expect(result.invalidReason).toContain("gasLimit");
+  });
+
+  it("24. should verify valid guardian signature and reject invalid guardian signature (SEC-04)", async () => {
+    const guardianMnemonic = Mnemonic.generate();
+    const guardianSigner = new UserSigner(guardianMnemonic.deriveKey(0));
+    const guardianAddress = Address.newFromBech32(guardianSigner.getAddress().bech32());
+
+    const amount = "1000000000000000000";
+    const tx = new Transaction({
+      nonce: 1n,
+      value: BigInt(amount),
+      sender: userAddress,
+      receiver: receiverAddress,
+      gasPrice: 1000000000n,
+      gasLimit: 50000n,
+      data: Buffer.from(""),
+      chainID: "D",
+      version: 2,
+      options: 0,
+      guardian: guardianAddress,
+    });
+
+    const bytesToSign = tc.computeBytesForSigning(tx);
+    const userSig = await userSigner.sign(bytesToSign);
+    tx.signature = userSig;
+
+    const bytesToVerify = tc.computeBytesForVerifying(tx);
+    const guardianSig = await guardianSigner.sign(bytesToVerify);
+    tx.guardianSignature = guardianSig;
+
+    const validPayload: MvxTransactionPayload = {
+      nonce: Number(tx.nonce),
+      value: tx.value.toString(),
+      receiver: tx.receiver.toBech32(),
+      sender: tx.sender.toBech32(),
+      gasPrice: Number(tx.gasPrice),
+      gasLimit: Number(tx.gasLimit),
+      data: "",
+      chainID: tx.chainID,
+      version: tx.version,
+      options: tx.options,
+      signature: userSig.toString("hex"),
+      guardian: guardianAddress.toBech32(),
+      guardianSignature: guardianSig.toString("hex"),
+    };
+
+    const requirements = {
+      scheme: "exact" as const,
+      network: "multiversx:D",
+      asset: "EGLD",
+      amount: amount,
+      payTo: receiverAddress.toBech32(),
+      maxTimeoutSeconds: 60,
+    };
+
+    const verifier = new VerifierService({ relayerPool });
+
+    // 1. Valid guardian signature -> true
+    const validResult = await verifier.verify({
+      paymentPayload: {
+        x402Version: 2,
+        accepted: requirements,
+        payload: validPayload,
+      },
+      paymentRequirements: requirements,
+    });
+    expect(validResult.isValid).toBe(true);
+
+    // 2. Corrupted guardian signature -> false
+    const corruptedPayload = {
+      ...validPayload,
+      guardianSignature: "00".repeat(64),
+    };
+    const invalidResult = await verifier.verify({
+      paymentPayload: {
+        x402Version: 2,
+        accepted: requirements,
+        payload: corruptedPayload,
+      },
+      paymentRequirements: requirements,
+    });
+    expect(invalidResult.isValid).toBe(false);
+    expect(invalidResult.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
+    expect(invalidResult.invalidReason).toContain("guardian signature");
+  });
 });
 

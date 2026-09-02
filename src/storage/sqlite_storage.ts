@@ -95,8 +95,8 @@ export class SqliteSettlementStorage implements ISettlementStorage {
         @id, @signature_hash, @payer, @receiver, @asset, @amount,
         @status, @tx_hash, @error_reason, @error_code, @created_at, @updated_at, @valid_before
       )
-      ON CONFLICT(id) DO UPDATE SET
-        signature_hash = excluded.signature_hash,
+      ON CONFLICT(signature_hash) DO UPDATE SET
+        id = excluded.id,
         payer = excluded.payer,
         receiver = excluded.receiver,
         asset = excluded.asset,

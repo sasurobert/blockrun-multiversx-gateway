@@ -91,16 +91,32 @@ export function decodeTransactionData(data?: string): string | undefined {
 }
 
 /**
+ * Extracts raw chain ID from network identifier (e.g. "multiversx:1" -> "1", "1" -> "1").
+ */
+export function extractChainID(network: string): string {
+  return network.includes(":") ? network.split(":")[1] : network;
+}
+
+/**
  * Parses all transfers (native EGLD, ESDT, MultiESDT) contained within a transaction payload.
+ * Enforces strict checks to ensure no arbitrary smart contract calls or extra endpoint arguments
+ * are piggybacked on pure payment transfers.
  */
 export function parseTransactionTransfers(payload: MvxTransactionPayload): ParsedTransfer[] {
   const transfers: ParsedTransfer[] = [];
 
   try {
+    const decodedData = decodeTransactionData(payload.data);
+
     // 1. Check native EGLD transfer
     if (payload.value && payload.value !== "0") {
       try {
         if (BigInt(payload.value) > 0n) {
+          // Native EGLD payment must not contain arbitrary smart contract call data
+          if (decodedData && decodedData.trim().length > 0 && decodedData !== "0") {
+            return []; // Rejection: contains injected contract call data
+          }
+
           transfers.push({
             type: "EGLD",
             asset: "EGLD",
@@ -115,70 +131,84 @@ export function parseTransactionTransfers(payload: MvxTransactionPayload): Parse
     }
 
     // 2. Check ESDT / Smart Transfer Data
-    const decodedData = decodeTransactionData(payload.data);
     if (decodedData) {
       const parts = decodedData.split("@");
       const funcName = parts[0];
 
-      if (funcName === "ESDTTransfer" && parts.length >= 3) {
-        try {
-          const tokenIdentifier = Buffer.from(parts[1], "hex").toString("utf8");
-          const amount = BigInt("0x" + (parts[2] || "0")).toString(10);
-          transfers.push({
-            type: "ESDT",
-            asset: tokenIdentifier,
-            amount: amount,
-            receiver: payload.receiver,
-            sender: payload.sender,
-          });
-        } catch {
-          // Ignore corrupted ESDT transfer part
+      // Pure ESDTTransfer must have strictly 3 parts: [funcName, tokenIdentifierHex, amountHex]
+      // Any additional parts (parts.length > 3) represent smart contract endpoints/arguments.
+      if (funcName === "ESDTTransfer") {
+        if (parts.length === 3) {
+          try {
+            const tokenIdentifier = Buffer.from(parts[1], "hex").toString("utf8");
+            const amount = BigInt("0x" + (parts[2] || "0")).toString(10);
+            transfers.push({
+              type: "ESDT",
+              asset: tokenIdentifier,
+              amount: amount,
+              receiver: payload.receiver,
+              sender: payload.sender,
+            });
+          } catch {
+            // Ignore corrupted ESDT transfer part
+          }
+        } else {
+          // Rejection: Contains appended smart contract execution parameters
+          return [];
         }
-      } else if (funcName === "ESDTNFTTransfer" && parts.length >= 5) {
-        try {
-          const tokenIdentifier = Buffer.from(parts[1], "hex").toString("utf8");
-          const nonce = parseInt(parts[2] || "0", 16);
-          const amount = BigInt("0x" + (parts[3] || "0")).toString(10);
-          const receiver = Address.newFromHex(parts[4]).toBech32();
-          transfers.push({
-            type: "ESDTNFT",
-            asset: tokenIdentifier,
-            amount: amount,
-            nonce: isNaN(nonce) ? 0 : nonce,
-            receiver: receiver,
-            sender: payload.sender,
-          });
-        } catch {
-          // Ignore corrupted ESDTNFT transfer part
+      } else if (funcName === "ESDTNFTTransfer") {
+        // Pure ESDTNFTTransfer must have strictly 5 parts: [funcName, tokenHex, nonceHex, amountHex, receiverHex]
+        if (parts.length === 5) {
+          try {
+            const tokenIdentifier = Buffer.from(parts[1], "hex").toString("utf8");
+            const nonce = parseInt(parts[2] || "0", 16);
+            const amount = BigInt("0x" + (parts[3] || "0")).toString(10);
+            const receiver = Address.newFromHex(parts[4]).toBech32();
+            transfers.push({
+              type: "ESDTNFT",
+              asset: tokenIdentifier,
+              amount: amount,
+              nonce: isNaN(nonce) ? 0 : nonce,
+              receiver: receiver,
+              sender: payload.sender,
+            });
+          } catch {
+            // Ignore corrupted ESDTNFT transfer part
+          }
+        } else {
+          // Rejection: Contains appended smart contract execution parameters
+          return [];
         }
-      } else if (funcName === "MultiESDTNFTTransfer" && parts.length >= 6) {
+      } else if (funcName === "MultiESDTNFTTransfer") {
+        // Pure MultiESDTNFTTransfer: [funcName, receiverHex, countHex, ...(tokenHex, nonceHex, amountHex)]
         try {
-          const receiver = Address.newFromHex(parts[1]).toBech32();
           const numTransfers = parseInt(parts[2] || "0", 16);
+          const expectedLength = 3 + numTransfers * 3;
 
-          for (let i = 0; i < (isNaN(numTransfers) ? 0 : numTransfers); i++) {
-            const baseIdx = 3 + i * 3;
-            if (parts.length >= baseIdx + 3) {
-              try {
-                const tokenIdentifier = Buffer.from(parts[baseIdx], "hex").toString("utf8");
-                const nonce = parseInt(parts[baseIdx + 1] || "0", 16);
-                const amount = BigInt("0x" + (parts[baseIdx + 2] || "0")).toString(10);
+          if (parts.length === expectedLength && numTransfers > 0) {
+            const receiver = Address.newFromHex(parts[1]).toBech32();
+            for (let i = 0; i < numTransfers; i++) {
+              const baseIdx = 3 + i * 3;
+              const tokenIdentifier = Buffer.from(parts[baseIdx], "hex").toString("utf8");
+              const nonce = parseInt(parts[baseIdx + 1] || "0", 16);
+              const amount = BigInt("0x" + (parts[baseIdx + 2] || "0")).toString(10);
 
-                transfers.push({
-                  type: "MultiESDTNFT",
-                  asset: tokenIdentifier,
-                  amount: amount,
-                  nonce: isNaN(nonce) ? 0 : nonce,
-                  receiver: receiver,
-                  sender: payload.sender,
-                });
-              } catch {
-                // Ignore individual malformed transfer part
-              }
+              transfers.push({
+                type: "MultiESDTNFT",
+                asset: tokenIdentifier,
+                amount: amount,
+                nonce: isNaN(nonce) ? 0 : nonce,
+                receiver: receiver,
+                sender: payload.sender,
+              });
             }
+          } else {
+            // Rejection: Contains appended smart contract execution parameters or invalid count
+            return [];
           }
         } catch {
           // Ignore malformed MultiESDTNFT payload
+          return [];
         }
       }
     }

@@ -8,7 +8,17 @@ import {
 } from "../domain/types.js";
 import { INetworkProvider } from "../domain/network.js";
 import { RelayerPoolManager } from "./relayer_pool.js";
-import { parseTransactionTransfers } from "../utils/data_parser.js";
+import { extractChainID, parseTransactionTransfers } from "../utils/data_parser.js";
+
+/**
+ * Maximum allowed gas price (2 Gwei / 2,000,000,000) to protect relayer wallets from drain attacks.
+ */
+export const MAX_ALLOWED_GAS_PRICE = 2_000_000_000n;
+
+/**
+ * Maximum allowed gas limit for relayer transactions (1,000,000 units) to prevent gas griefing.
+ */
+export const MAX_ALLOWED_RELAYER_GAS_LIMIT = 1_000_000n;
 
 /**
  * Configuration options for VerifierService.
@@ -76,12 +86,40 @@ export class VerifierService implements IVerifierService {
     }
 
     // 3. Network / ChainID compatibility
-    const expectedChainID = paymentRequirements.network.split(":")[1];
+    const expectedChainID = extractChainID(paymentRequirements.network);
     if (expectedChainID && txPayload.chainID !== expectedChainID) {
       return {
         isValid: false,
         errorCode: PaymentErrorCode.PAYMENT_INVALID,
         invalidReason: `Network mismatch: expected chainID ${expectedChainID}, got ${txPayload.chainID}`,
+        payer: txPayload.sender,
+      };
+    }
+
+    // 3b. Gas Price & Relayer Gas Limit Security Bounds (SEC-02)
+    try {
+      if (BigInt(txPayload.gasPrice) > MAX_ALLOWED_GAS_PRICE) {
+        return {
+          isValid: false,
+          errorCode: PaymentErrorCode.PAYMENT_INVALID,
+          invalidReason: `gasPrice ${txPayload.gasPrice} exceeds maximum allowed (${MAX_ALLOWED_GAS_PRICE})`,
+          payer: txPayload.sender,
+        };
+      }
+
+      if (txPayload.relayer && BigInt(txPayload.gasLimit) > MAX_ALLOWED_RELAYER_GAS_LIMIT) {
+        return {
+          isValid: false,
+          errorCode: PaymentErrorCode.PAYMENT_INVALID,
+          invalidReason: `gasLimit ${txPayload.gasLimit} exceeds maximum allowed relayer gas limit (${MAX_ALLOWED_RELAYER_GAS_LIMIT})`,
+          payer: txPayload.sender,
+        };
+      }
+    } catch {
+      return {
+        isValid: false,
+        errorCode: PaymentErrorCode.PAYMENT_INVALID,
+        invalidReason: "Invalid integer format for gasPrice or gasLimit",
         payer: txPayload.sender,
       };
     }
@@ -124,7 +162,7 @@ export class VerifierService implements IVerifierService {
       return {
         isValid: false,
         errorCode: PaymentErrorCode.PAYMENT_INVALID,
-        invalidReason: "No transfer details found in transaction payload",
+        invalidReason: "No valid pure transfer details found in transaction payload",
         payer: txPayload.sender,
       };
     }
@@ -227,6 +265,41 @@ export class VerifierService implements IVerifierService {
       };
     }
 
+    // 6b. Guardian Signature Verification (SEC-04)
+    if (txPayload.guardian && guardianAddr) {
+      if (!txPayload.guardianSignature) {
+        return {
+          isValid: false,
+          errorCode: PaymentErrorCode.PAYMENT_INVALID,
+          invalidReason: "Missing required guardian signature for guarded transaction",
+          payer: txPayload.sender,
+        };
+      }
+
+      try {
+        const bytesToVerify = this.transactionComputer.computeBytesForVerifying(tx);
+        const guardianVerifier = new UserVerifier(new UserPublicKey(guardianAddr.getPublicKey()));
+        const isGuardianSignatureValid = guardianVerifier.verify(bytesToVerify, tx.guardianSignature);
+
+        if (!isGuardianSignatureValid) {
+          return {
+            isValid: false,
+            errorCode: PaymentErrorCode.PAYMENT_INVALID,
+            invalidReason: "Invalid guardian signature on transaction",
+            payer: txPayload.sender,
+          };
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          isValid: false,
+          errorCode: PaymentErrorCode.PAYMENT_INVALID,
+          invalidReason: `Failed to verify guardian signature: ${message}`,
+          payer: txPayload.sender,
+        };
+      }
+    }
+
     // 7. Relayed V3 Verification
     if (txPayload.relayer) {
       if (this.relayerPool) {
@@ -282,7 +355,38 @@ export class VerifierService implements IVerifierService {
     // 8. Network Simulation (if networkProvider provided)
     if (this.networkProvider) {
       try {
-        const simResult = await this.networkProvider.simulateTransaction(tx);
+        let txToSimulate = tx;
+        // SEC-03: If Relayed V3 and missing relayer signature, temporarily countersign for simulation
+        if (txPayload.relayer && !txPayload.relayerSignature && this.relayerPool) {
+          try {
+            const relayerSigner = this.relayerPool.getRelayerForAddress(txPayload.sender);
+            const bytesToSign = this.transactionComputer.computeBytesForSigning(tx);
+            const relayerSig = await relayerSigner.sign(bytesToSign);
+            txToSimulate = new Transaction({
+              nonce: tx.nonce,
+              value: tx.value,
+              sender: tx.sender,
+              receiver: tx.receiver,
+              gasPrice: tx.gasPrice,
+              gasLimit: tx.gasLimit,
+              data: tx.data,
+              chainID: tx.chainID,
+              version: tx.version,
+              options: tx.options,
+              relayer: tx.relayer,
+              guardian: tx.guardian,
+            });
+            txToSimulate.signature = tx.signature;
+            txToSimulate.relayerSignature = relayerSig;
+            if (tx.guardianSignature) {
+              txToSimulate.guardianSignature = tx.guardianSignature;
+            }
+          } catch {
+            // Fallback to original tx if relayer signing fails
+          }
+        }
+
+        const simResult = await this.networkProvider.simulateTransaction(txToSimulate);
         const statusLower = simResult.status?.toLowerCase();
         const returnCodeLower = simResult.returnCode?.toLowerCase();
 

@@ -303,8 +303,15 @@ export class BlockRunMvxClient {
       }
 
       // Step 4: Enforce spend limits
-      const costMicroUsdc = parseInt(requirement.amount, 10);
-      const costUsd = costMicroUsdc / 1_000_000;
+      const decimals = typeof (requirement.extra as any)?.decimals === "number" ? (requirement.extra as any).decimals : 6;
+      let costUsd = 0;
+      try {
+        const rawAmount = BigInt(requirement.amount);
+        const divisor = 10n ** BigInt(decimals);
+        costUsd = Number(rawAmount) / Number(divisor);
+      } catch {
+        costUsd = parseInt(requirement.amount, 10) / (10 ** decimals);
+      }
 
       if (this.maxCostPerCall !== undefined && costUsd > this.maxCostPerCall) {
         throw new SpendLimitError(
