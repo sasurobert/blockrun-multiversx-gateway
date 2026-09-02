@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blockrun-mvx"
+version = "1.0.0"
+description = "MultiversX Autonomous AI Agent Client SDK for BlockRun AI Gateway"
+readme = "README.md"
+authors = [{ name = "MultiversX AI Foundation" }]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = [
+    "pynacl>=1.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]

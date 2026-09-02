@@ -586,5 +586,93 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         await new Promise<void>((r) => rlServer.close(() => r()));
       }
     });
+
+    it("should support SSE streaming on /api/v1/chat/completions when stream: true", async () => {
+      const reqBody = {
+        model: "openai/gpt-5.4",
+        messages: [{ role: "user", content: "Tell me a short poem" }],
+        stream: true,
+      };
+
+      // 1. Unpaid request receives 402 challenge
+      const challenge = await request(server).post("/api/v1/chat/completions").send(reqBody);
+      expect(challenge.status).toBe(402);
+      expect(challenge.body.accepts).toBeDefined();
+
+      // 2. Sign payment and request with stream: true
+      const payload = await createPaymentPayload(challenge.body.accepts[0]);
+      const res = await request(server)
+        .post("/api/v1/chat/completions")
+        .set("PAYMENT-SIGNATURE", encodeHeaderJson(payload))
+        .send(reqBody);
+
+      expect(res.status).toBe(200);
+      expect(res.headers["content-type"]).toContain("text/event-stream");
+      expect(res.headers["x-payment-receipt"]).toBeDefined();
+      expect(res.text).toContain("data: ");
+      expect(res.text).toContain("[DONE]");
+    });
+
+    it("should support SSE streaming on /api/v1/messages for Anthropic when stream: true", async () => {
+      const reqBody = {
+        model: "anthropic/claude-sonnet-4.6",
+        messages: [{ role: "user", content: "Hello streaming Claude" }],
+        stream: true,
+      };
+
+      const challenge = await request(server).post("/api/v1/messages").send(reqBody);
+      expect(challenge.status).toBe(402);
+
+      const payload = await createPaymentPayload(challenge.body.accepts[0]);
+      const res = await request(server)
+        .post("/api/v1/messages")
+        .set("PAYMENT-SIGNATURE", encodeHeaderJson(payload))
+        .send(reqBody);
+
+      expect(res.status).toBe(200);
+      expect(res.headers["content-type"]).toContain("text/event-stream");
+      expect(res.headers["x-payment-receipt"]).toBeDefined();
+      expect(res.text).toContain("event: message_start");
+      expect(res.text).toContain("event: content_block_delta");
+      expect(res.text).toContain("event: message_stop");
+    });
+
+    it("should pass AbortSignal to upstream AI handler and trigger on timeout", async () => {
+      let receivedSignal: AbortSignal | undefined;
+      const abortableApp = createBlockRunGateway({
+        verifier,
+        settlementQueue,
+        payTo: merchantAddress.toBech32(),
+        upstreamTimeoutMs: 50,
+        rateLimit: { enabled: false },
+        upstreamAiHandler: async (_req, signal) => {
+          receivedSignal = signal;
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          return { content: "Done" };
+        },
+      });
+
+      const abortServer = abortableApp.listen(0, "127.0.0.1");
+      try {
+        const reqBody = {
+          model: "openai/gpt-5.4",
+          messages: [{ role: "user", content: "Test signal" }],
+        };
+
+        const challenge = await request(abortServer).post("/api/v1/chat/completions").send(reqBody);
+        const payload = await createPaymentPayload(challenge.body.accepts[0]);
+
+        const res = await request(abortServer)
+          .post("/api/v1/chat/completions")
+          .set("PAYMENT-SIGNATURE", encodeHeaderJson(payload))
+          .send(reqBody);
+
+        expect(res.status).toBe(504);
+        expect(receivedSignal).toBeDefined();
+        expect(receivedSignal?.aborted).toBe(true);
+      } finally {
+        await new Promise<void>((r) => abortServer.close(() => r()));
+      }
+    });
   });
 });

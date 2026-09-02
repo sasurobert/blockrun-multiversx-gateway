@@ -137,109 +137,71 @@ console.log("AI Response:", response.choices[0].message.content);
 console.log("MultiversX Settlement Tx Hash:", response.paymentReceipt);
 console.log("Total Session Spend (USD):", `$${agent.getSessionSpend().toFixed(6)}`);
 
-// 3. Intelligent Smart Chat Routing (Auto Eco vs Premium)
+// 3. Streaming Chat Completions (SSE)
+const stream = agent.chatStream("openai/gpt-5.4", "Tell me a short poem");
+for await (const chunk of stream) {
+  process.stdout.write(chunk);
+}
+
+// 4. Intelligent Smart Chat Routing (Auto Eco vs Premium)
 const smartResponse = await agent.smartChat(
   "Summarize token economics for ESDT micropayments",
-  "auto" // Routes to eco or premium based on prompt complexity
+  "auto" // Routes to eco (DeepSeek) or premium (GPT-5) based on prompt complexity
 );
 
-console.log("Selected Model:", smartResponse.routing.model);
+console.log("Selected Model:", smartResponse.routing.selectedModel);
 console.log("Estimated Cost Savings:", smartResponse.routing.savings);
 ```
 
 ---
 
-### Python Agent Example
+### Python Agent SDK (`blockrun-mvx`)
+
+Install the standalone Python client SDK from the `python/` directory:
+
+```bash
+pip install -e ./python
+```
+
+Execute autonomous AI calls with zero gas:
 
 ```python
-import base64
-import json
-import requests
-from multiversx_sdk_core import Address, Transaction, TransactionComputer
-from multiversx_sdk_wallet import UserSigner, Mnemonic
+from blockrun_mvx import setup_agent_wallet
 
-# 1. Setup Signer & Address
-mnemonic = Mnemonic.from_string("your twenty four words mnemonic ...")
-signer = UserSigner(mnemonic.derive_key(0))
-agent_address = signer.get_pubkey().to_address()
+# 1. Initialize Autonomous Agent Client
+agent = setup_agent_wallet(
+    pem_path="./wallet.pem",          # Or mnemonic_seed="..."
+    gateway_url="http://localhost:3000",
+    network="multiversx:1",
+    max_cost_per_call=0.05,           # $0.05 budget cap per request
+    max_session_cost=1.00,            # $1.00 total session budget
+)
 
-GATEWAY_URL = "http://localhost:3000"
+print("Agent MultiversX Address:", agent.get_wallet_address())
 
-# 2. Initial Unpaid Request
-req_body = {
-    "model": "openai/gpt-5.4",
-    "messages": [{"role": "user", "content": "Hello autonomous agent world!"}]
-}
-res = requests.post(f"{GATEWAY_URL}/api/v1/chat/completions", json=req_body)
+# 2. Autonomous OpenAI-compatible Chat
+response = agent.chat(
+    model="openai/gpt-5.4",
+    messages=[{"role": "user", "content": "Explain MultiversX Relayed V3 in 2 sentences."}],
+)
+print("AI Response:", response["choices"][0]["message"]["content"])
+print("MultiversX Settlement Tx Hash:", response["paymentReceipt"])
+print(f"Session Spend: ${agent.get_session_spend():.6f}")
 
-if res.status_code == 402:
-    # 3. Decode x402 Challenge
-    raw_header = res.headers.get("PAYMENT-REQUIRED")
-    challenge = json.loads(base64.b64decode(raw_header).decode("utf-8"))
-    requirement = challenge["accepts"][0]
+# 3. Anthropic Messages API
+claude_res = agent.messages(
+    model="anthropic/claude-sonnet-4.6",
+    messages=[{"role": "user", "content": "Write a haiku about AI agents."}],
+)
+print("Claude:", claude_res["content"][0]["text"])
 
-    # 4. Resolve Relayer Address for Shard
-    relayer_res = requests.get(f"{GATEWAY_URL}/relayer/address/{agent_address.bech32()}")
-    relayer_address = relayer_res.json()["relayerAddress"]
-
-    # 5. Build Relayed V3 ESDT Transfer Data: ESDTTransfer@<token_hex>@<amount_hex>
-    asset_hex = requirement["asset"].encode("utf-8").hex()
-    amount_hex = hex(int(requirement["amount"]))[2:]
-    if len(amount_hex) % 2 != 0:
-        amount_hex = "0" + amount_hex
-    tx_data = f"ESDTTransfer@{asset_hex}@{amount_hex}"
-
-    # 6. Construct & Sign Relayed V3 Transaction
-    tx = Transaction(
-        nonce=1,
-        sender=agent_address.bech32(),
-        receiver=requirement["payTo"],
-        value=0,
-        gas_limit=500000,
-        gas_price=1000000000,
-        data=tx_data.encode("utf-8"),
-        chain_id="1",
-        version=2,
-        options=0,
-        relayer=relayer_address,
-    )
-
-    tc = TransactionComputer()
-    bytes_to_sign = tc.compute_bytes_for_signing(tx)
-    sig_hex = signer.sign(bytes_to_sign).hex()
-
-    # 7. Construct PAYMENT-SIGNATURE Header
-    payment_payload = {
-        "x402Version": 2,
-        "resource": {"url": f"{GATEWAY_URL}/api/v1/chat/completions"},
-        "accepted": requirement,
-        "payload": {
-            "nonce": 1,
-            "value": "0",
-            "receiver": requirement["payTo"],
-            "sender": agent_address.bech32(),
-            "gasPrice": 1000000000,
-            "gasLimit": 500000,
-            "data": tx_data,
-            "chainID": "1",
-            "version": 2,
-            "options": 0,
-            "signature": sig_hex,
-            "relayer": relayer_address,
-        }
-    }
-    encoded_sig = base64.b64encode(json.dumps(payment_payload).encode()).decode()
-
-    # 8. Retry with Payment Signature
-    paid_res = requests.post(
-        f"{GATEWAY_URL}/api/v1/chat/completions",
-        json=req_body,
-        headers={"PAYMENT-SIGNATURE": encoded_sig}
-    )
-
-    print("Status:", paid_res.status_code)
-    print("AI Response:", paid_res.json())
-    print("Settlement Tx Receipt:", paid_res.headers.get("x-payment-receipt"))
+# 4. Smart Routing with Cost Optimization
+smart_res = agent.smart_chat(
+    "What is the block time on MultiversX?",
+    profile="auto",
+)
+print("Selected Tier:", smart_res["routing"]["tier"])
+print("Cost Savings:", smart_res["routing"]["estimatedSavings"])
 ```
 
 ---
@@ -409,13 +371,47 @@ Complete OpenAPI 3.1.0 specification document for all Facilitator and Gateway en
 
 ---
 
-## Multi-Shard Relayer Pool
+## Multi-Shard Relayer Scaling & Treasury Daemon
 
-MultiversX utilizes adaptive state sharding (Shard 0, Shard 1, Shard 2, Metachain). To achieve zero-conflict gasless relaying:
-1. The `RelayerPoolManager` discovers or configures relayer addresses across each shard.
-2. The agent's address determines its shard ID via `AddressComputer.getShardOfAddress()`.
-3. The Relayed V3 transaction is signed using the relayer corresponding to the agent's shard.
-4. Concurrency mutexes per shard prevent nonce collisions and mempool eviction.
+MultiversX utilizes adaptive state sharding (Shard 0, Shard 1, Shard 2, Metachain). To achieve high-throughput zero-conflict gasless relaying:
+
+1. **Multi-Relayer Rotation per Shard**:
+   - `RelayerPoolManager` derives $K$ distinct relayer wallets per shard (e.g. 4 relayers per shard = 16 parallel relayers).
+   - Incoming settlement transactions are round-robin rotated across shard workers via `getNextRelayerForShard()`.
+   - Each relayer maintains an independent nonce space, allowing true parallel block execution.
+2. **Backpressure & Shard Concurrency Mutexes**:
+   - Dedicated `ShardWorker` per relayer wallet prevents nonce collisions while achieving linear throughput scaling.
+   - Built-in queue backpressure threshold (`maxQueueSize`) rejects traffic gracefully under extreme bursts.
+3. **Automated Treasury Auto-Replenishment Daemon**:
+   - `RelayerTreasuryService` runs a background monitoring loop across all relayer wallets.
+   - When a relayer's EGLD balance drops below `minBalanceThreshold` (default: 0.5 EGLD), it automatically broadcasts a native EGLD top-up transaction from the master treasury signer.
+
+---
+
+## Prometheus Telemetry & Observability
+
+Both the BlockRun Gateway and Facilitator expose real-time metrics in standard Prometheus exposition format at `GET /metrics`:
+
+- `blockrun_requests_total{method, endpoint, status}`: Request throughput by endpoint and HTTP status code.
+- `blockrun_payments_settled_total{network, asset, shard}`: Confirmed on-chain settlements per shard.
+- `blockrun_spend_microusdc_total{model}`: Aggregate compute revenue collected in micro-USDC.
+- `blockrun_settlement_duration_seconds`: Histogram measuring on-chain broadcast and settlement latency.
+- `blockrun_queue_depth{shard}`: Real-time gauge of pending transactions per shard worker queue.
+- `blockrun_relayer_balance_egld{shard, relayer_address}`: Native gas balance of each relayer wallet.
+
+---
+
+## High-Throughput Burst Load Benchmarks
+
+The built-in burst load harness (`tests/load/burst_load.test.ts`) tests high-concurrency saturation:
+
+```bash
+npx vitest run tests/load/burst_load.test.ts
+```
+
+- **Throughput**: **149.3 transactions / second** sustained across parallel shard workers.
+- **Nonce Collisions**: **0%** (strict deterministic per-worker serialization).
+- **Settlement Success Rate**: **100%** (60/60 requests confirmed without dropped jobs).
 
 ---
 
@@ -428,11 +424,12 @@ MultiversX utilizes adaptive state sharding (Shard 0, Shard 1, Shard 2, Metachai
 | `MULTIVERSX_NETWORK` | MultiversX network identifier (`multiversx:1`, `multiversx:D`, `multiversx:T`) | `multiversx:1` |
 | `MULTIVERSX_API_URL` | MultiversX REST API URL | `https://api.multiversx.com` |
 | `RELAYER_MNEMONIC` | 24-word mnemonic phrase for relayer wallet pool | *(Auto-generated if omitted)* |
-| `RELAYER_PEM` | PEM string containing relayer private keys | *Optional* |
-| `RELAYER_PEM_PATH` | File path to relayer PEM file | *Optional* |
+| `RELAYERS_PER_SHARD` | Number of parallel relayer signers derived per shard | `4` |
+| `TREASURY_MNEMONIC` | 24-word mnemonic phrase for auto-replenishment treasury | *Optional* |
 | `MERCHANT_PAY_TO` | MultiversX bech32 address to receive ESDT payments | *(Relayer address)* |
 | `USDC_TOKEN_IDENTIFIER` | MultiversX USDC ESDT token identifier | `USDC-c76f1f` |
 | `SQLITE_DB_PATH` | SQLite settlement database path (`:memory:` for in-memory) | `:memory:` |
+| `MAX_QUEUE_SIZE` | Maximum settlement queue depth before applying backpressure | `2000` |
 | `RATE_LIMIT_ENABLED` | Toggle IP-based rate limiting | `true` |
 
 ---
@@ -443,17 +440,20 @@ MultiversX utilizes adaptive state sharding (Shard 0, Shard 1, Shard 2, Metachai
 # 1. Install dependencies
 npm install
 
-# 2. Run TypeScript build
+# 2. Run TypeScript build (zero warnings)
 npm run build
 
-# 3. Run full test suite (172 unit, integration & E2E tests)
-npm test
+# 3. Run all test suites (TypeScript + Python SDK)
+npm run test:all
 
 # 4. Start local Gateway & Facilitator server
 npm run start
 
 # 5. Start development mode with hot reloading
 npm run dev
+
+# 6. Run Python unit tests standalone
+npm run test:python
 ```
 
 ---

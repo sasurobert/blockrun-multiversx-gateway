@@ -18,6 +18,7 @@ import {
   extractPaymentPayload,
 } from "../utils/header_utils.js";
 import { generateOpenApiSpec } from "./openapi.js";
+import { defaultMetricsRegistry } from "./metrics.js";
 
 /**
  * Rate limiting configuration options.
@@ -236,18 +237,18 @@ export function createFacilitatorServer(options: FacilitatorServerOptions): Expr
    * Resolves the relayer address and shard ID for a MultiversX user address.
    */
   app.get("/relayer/address/:userAddress", (req: Request, res: Response) => {
+    if (!options.relayerPool) {
+      res.status(503).json({
+        error: "Relayer pool is not configured on this facilitator",
+      });
+      return;
+    }
+
     const parseResult = MvxAddressSchema.safeParse(req.params.userAddress);
     if (!parseResult.success) {
       res.status(400).json({
         error: "Invalid MultiversX address format",
         details: parseResult.error.format(),
-      });
-      return;
-    }
-
-    if (!options.relayerPool) {
-      res.status(503).json({
-        error: "Relayer pool is not configured on this facilitator",
       });
       return;
     }
@@ -279,6 +280,15 @@ export function createFacilitatorServer(options: FacilitatorServerOptions): Expr
     const relayerMap = options.relayerPool.getAllRelayerAddresses();
     const shards = Object.keys(relayerMap).map(Number);
     res.json({ relayers: relayerMap, shards });
+  });
+
+  /**
+   * GET /metrics
+   * Prometheus metrics exposition format.
+   */
+  app.get("/metrics", (_req: Request, res: Response) => {
+    res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    res.send(defaultMetricsRegistry.serialize());
   });
 
   /**

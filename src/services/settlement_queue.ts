@@ -5,8 +5,10 @@ import {
   SettleResponse,
   MvxTransactionPayload,
 } from "../domain/types.js";
-import { ISettlerService } from "./settler.js";
+import { SettlerService, ISettlerService } from "./settler.js";
 import { RelayerPoolManager, METACHAIN_SHARD_ID } from "./relayer_pool.js";
+import { ISettlementStorage } from "../storage/types.js";
+import { INetworkProvider } from "../domain/network.js";
 
 /**
  * Statistics tracked per shard queue.
@@ -22,12 +24,17 @@ export interface ShardQueueStats {
  * Configuration options for SettlementQueue.
  */
 export interface SettlementQueueConfig {
-  settler: ISettlerService;
+  settler?: ISettlerService;
+  storage?: ISettlementStorage;
+  networkProvider?: INetworkProvider;
+  simulationEnabled?: boolean;
+  concurrencyPerShard?: number;
   relayerPool?: RelayerPoolManager;
   maxRetries?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
   backoffMultiplier?: number;
+  maxQueueSize?: number;
   isTransientError?: (error: unknown, response?: SettleResponse) => boolean;
 }
 
@@ -50,10 +57,11 @@ interface QueuedItem {
 
 /**
  * Single shard asynchronous worker queue.
- * Ensures strict concurrency serialization (mutex) per shard relayer to prevent nonce collision.
+ * Ensures strict concurrency serialization (mutex) per relayer wallet to prevent nonce collision.
  */
 class ShardWorker {
   public readonly shard: number;
+  public readonly relayerAddress?: string;
   private readonly settler: ISettlerService;
   private readonly maxRetries: number;
   private readonly baseDelayMs: number;
@@ -77,11 +85,13 @@ class ShardWorker {
       baseDelayMs: number;
       maxDelayMs: number;
       backoffMultiplier: number;
+      relayerAddress?: string;
       isTransientFn: (error: unknown, response?: SettleResponse) => boolean;
     }
   ) {
     this.shard = shard;
     this.settler = settler;
+    this.relayerAddress = config.relayerAddress;
     this.maxRetries = config.maxRetries;
     this.baseDelayMs = config.baseDelayMs;
     this.maxDelayMs = config.maxDelayMs;
@@ -114,22 +124,29 @@ class ShardWorker {
       return;
     }
 
+    const { request, resolve } = item;
+
     try {
-      const response = await this.executeWithRetry(item.request);
+      const response = await this.executeWithRetry(request);
       if (response.success) {
         this.processedCount++;
       } else {
         this.failedCount++;
       }
-      item.resolve(response);
+      resolve(response);
     } catch (err: unknown) {
       this.failedCount++;
       const message = err instanceof Error ? err.message : String(err);
-      item.resolve({
+      const rawPayload = request.paymentPayload.payload;
+      const txPayload: MvxTransactionPayload =
+        "transaction" in rawPayload ? rawPayload.transaction : rawPayload;
+
+      resolve({
         success: false,
-        errorReason: message,
         errorCode: PaymentErrorCode.PAYMENT_INVALID,
-        network: item.request.paymentRequirements.network,
+        errorReason: `Internal queue execution error: ${message}`,
+        network: request.paymentRequirements.network,
+        payer: txPayload.sender,
       });
     } finally {
       this.pendingCount = Math.max(0, this.pendingCount - 1);
@@ -140,59 +157,47 @@ class ShardWorker {
 
   private async executeWithRetry(request: SettleRequest): Promise<SettleResponse> {
     let attempt = 0;
-    let lastError: unknown;
-    let lastResponse: SettleResponse | undefined;
+    let delay = this.baseDelayMs;
 
-    while (attempt <= this.maxRetries) {
+    while (true) {
+      attempt++;
       try {
         const response = await this.settler.settle(request);
+
         if (response.success) {
           return response;
         }
 
-        // Response indicated failure
-        lastResponse = response;
-        if (!this.isTransientFn(undefined, response)) {
-          // Deterministic error (e.g. invalid signature, expired, unfunded) -> do not retry
+        // Check if response error is classified as transient
+        const isTransient = this.isTransientFn(null, response);
+        if (!isTransient || attempt > this.maxRetries) {
           return response;
         }
 
-        // Transient error in response -> retry
-        lastError = new Error(response.errorReason || "Transient settlement failure");
+        // Transient failure, wait and retry
+        await this.sleep(delay);
+        delay = Math.min(this.maxDelayMs, delay * this.backoffMultiplier);
       } catch (err: unknown) {
-        lastError = err;
-        if (!this.isTransientFn(err, undefined)) {
+        const isTransient = this.isTransientFn(err);
+        if (!isTransient || attempt > this.maxRetries) {
           throw err;
         }
-      }
 
-      attempt++;
-      if (attempt <= this.maxRetries) {
-        const delay = Math.min(
-          this.maxDelayMs,
-          this.baseDelayMs * Math.pow(this.backoffMultiplier, attempt - 1)
-        );
-        await new Promise((resolve) => setTimeout(resolve, delay));
+        await this.sleep(delay);
+        delay = Math.min(this.maxDelayMs, delay * this.backoffMultiplier);
       }
     }
-
-    if (lastResponse) {
-      return lastResponse;
-    }
-
-    const message = lastError instanceof Error ? lastError.message : String(lastError);
-    return {
-      success: false,
-      errorReason: message,
-      errorCode: PaymentErrorCode.PAYMENT_INVALID,
-      network: request.paymentRequirements.network,
-    };
   }
 
-  public drain(): Promise<void> {
-    if (this.pendingCount === 0 && this.queue.length === 0 && !this.isProcessing) {
-      return Promise.resolve();
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  public async drain(): Promise<void> {
+    if (this.queue.length === 0 && this.pendingCount === 0 && !this.isProcessing) {
+      return;
     }
+
     return new Promise<void>((resolve) => {
       this.drainResolvers.push(resolve);
     });
@@ -206,23 +211,37 @@ class ShardWorker {
 
 /**
  * High-Throughput Shard-Partitioned Settlement Queue.
- * Routes transactions to dedicated per-shard workers (Shard 0, 1, 2, Metachain)
- * with strict relayer nonce serialization and exponential retry on transient errors.
+ * Routes transactions to dedicated workers across shards (Shard 0, 1, 2, Metachain)
+ * with support for multiple parallel relayer workers per shard and backpressure safeguards.
  */
 export class SettlementQueue implements ISettlementQueue {
   private readonly settler: ISettlerService;
   private readonly relayerPool?: RelayerPoolManager;
   private readonly addressComputer: AddressComputer;
-  private readonly shardWorkers: Map<number, ShardWorker> = new Map();
+  private readonly shardWorkers: Map<number, ShardWorker[]> = new Map();
 
   private readonly maxRetries: number;
   private readonly baseDelayMs: number;
   private readonly maxDelayMs: number;
   private readonly backoffMultiplier: number;
+  private readonly maxQueueSize: number;
   private readonly isTransientFn: (error: unknown, response?: SettleResponse) => boolean;
 
   constructor(config: SettlementQueueConfig) {
-    this.settler = config.settler;
+    if (config.settler) {
+      this.settler = config.settler;
+    } else if (config.storage && config.networkProvider) {
+      this.settler = new SettlerService({
+        storage: config.storage,
+        networkProvider: config.networkProvider,
+        relayerPool: config.relayerPool,
+        simulateBeforeBroadcast: config.simulationEnabled ?? false,
+      });
+    } else {
+      throw new Error(
+        "SettlementQueue requires either 'settler' or both 'storage' and 'networkProvider'"
+      );
+    }
     this.relayerPool = config.relayerPool;
     this.addressComputer = new AddressComputer();
 
@@ -230,12 +249,13 @@ export class SettlementQueue implements ISettlementQueue {
     this.baseDelayMs = config.baseDelayMs ?? 50;
     this.maxDelayMs = config.maxDelayMs ?? 2000;
     this.backoffMultiplier = config.backoffMultiplier ?? 2;
+    this.maxQueueSize = config.maxQueueSize ?? 2000;
     this.isTransientFn = config.isTransientError ?? SettlementQueue.defaultIsTransientError;
 
     // Initialize standard shard workers (0, 1, 2, Metachain)
     const initialShards = [0, 1, 2, METACHAIN_SHARD_ID];
     for (const shard of initialShards) {
-      this.getOrCreateWorker(shard);
+      this.getOrCreateWorkersForShard(shard);
     }
   }
 
@@ -296,19 +316,44 @@ export class SettlementQueue implements ISettlementQueue {
     return false;
   }
 
-  private getOrCreateWorker(shard: number): ShardWorker {
-    let worker = this.shardWorkers.get(shard);
-    if (!worker) {
-      worker = new ShardWorker(shard, this.settler, {
-        maxRetries: this.maxRetries,
-        baseDelayMs: this.baseDelayMs,
-        maxDelayMs: this.maxDelayMs,
-        backoffMultiplier: this.backoffMultiplier,
-        isTransientFn: this.isTransientFn,
-      });
-      this.shardWorkers.set(shard, worker);
+  private getOrCreateWorkersForShard(shard: number): ShardWorker[] {
+    let workers = this.shardWorkers.get(shard);
+    if (!workers || workers.length === 0) {
+      workers = [];
+
+      if (this.relayerPool && this.relayerPool.hasShard(shard)) {
+        const relayers = this.relayerPool.getAllRelayersForShard(shard);
+        for (const relayer of relayers) {
+          const relayerAddress = relayer.getAddress().bech32();
+          workers.push(
+            new ShardWorker(shard, this.settler, {
+              maxRetries: this.maxRetries,
+              baseDelayMs: this.baseDelayMs,
+              maxDelayMs: this.maxDelayMs,
+              backoffMultiplier: this.backoffMultiplier,
+              relayerAddress,
+              isTransientFn: this.isTransientFn,
+            })
+          );
+        }
+      }
+
+      // If no pool or no relayers for shard, create default fallback worker
+      if (workers.length === 0) {
+        workers.push(
+          new ShardWorker(shard, this.settler, {
+            maxRetries: this.maxRetries,
+            baseDelayMs: this.baseDelayMs,
+            maxDelayMs: this.maxDelayMs,
+            backoffMultiplier: this.backoffMultiplier,
+            isTransientFn: this.isTransientFn,
+          })
+        );
+      }
+
+      this.shardWorkers.set(shard, workers);
     }
-    return worker;
+    return workers;
   }
 
   /**
@@ -331,12 +376,45 @@ export class SettlementQueue implements ISettlementQueue {
   }
 
   /**
-   * Enqueues a settlement request into the appropriate shard worker queue.
+   * Enqueues a settlement request into the appropriate shard relayer worker queue.
    */
   async enqueue(request: SettleRequest): Promise<SettleResponse> {
+    const totalPending = this.getPendingCount();
+    if (totalPending >= this.maxQueueSize) {
+      const rawPayload = request.paymentPayload.payload;
+      const txPayload: MvxTransactionPayload =
+        "transaction" in rawPayload ? rawPayload.transaction : rawPayload;
+
+      return {
+        success: false,
+        errorCode: PaymentErrorCode.PAYMENT_INVALID,
+        errorReason: `Settlement queue saturated: current pending jobs (${totalPending}) exceeded max limit (${this.maxQueueSize})`,
+        network: request.paymentRequirements.network,
+        payer: txPayload.sender,
+      };
+    }
+
     const shard = this.getShardForRequest(request);
-    const worker = this.getOrCreateWorker(shard);
-    return worker.enqueue(request);
+    const workers = this.getOrCreateWorkersForShard(shard);
+
+    const rawPayload = request.paymentPayload.payload;
+    const txPayload: MvxTransactionPayload =
+      "transaction" in rawPayload ? rawPayload.transaction : rawPayload;
+
+    // Check if the transaction already targeted a specific relayer address
+    let selectedWorker: ShardWorker | undefined;
+    if (txPayload.relayer) {
+      selectedWorker = workers.find((w) => w.relayerAddress === txPayload.relayer);
+    }
+
+    // Otherwise select the least-loaded worker in this shard
+    if (!selectedWorker) {
+      selectedWorker = workers.reduce((prev, curr) =>
+        curr.pendingCount < prev.pendingCount ? curr : prev
+      );
+    }
+
+    return selectedWorker.enqueue(request);
   }
 
   /**
@@ -344,12 +422,15 @@ export class SettlementQueue implements ISettlementQueue {
    */
   getPendingCount(shard?: number): number {
     if (shard !== undefined) {
-      return this.shardWorkers.get(shard)?.pendingCount ?? 0;
+      const workers = this.shardWorkers.get(shard) || [];
+      return workers.reduce((sum, w) => sum + w.pendingCount, 0);
     }
 
     let total = 0;
-    for (const worker of this.shardWorkers.values()) {
-      total += worker.pendingCount;
+    for (const workers of this.shardWorkers.values()) {
+      for (const worker of workers) {
+        total += worker.pendingCount;
+      }
     }
     return total;
   }
@@ -359,12 +440,12 @@ export class SettlementQueue implements ISettlementQueue {
    */
   getShardStats(): Record<number, ShardQueueStats> {
     const stats: Record<number, ShardQueueStats> = {};
-    for (const [shard, worker] of this.shardWorkers.entries()) {
+    for (const [shard, workers] of this.shardWorkers.entries()) {
       stats[shard] = {
         shard,
-        pendingCount: worker.pendingCount,
-        processedCount: worker.processedCount,
-        failedCount: worker.failedCount,
+        pendingCount: workers.reduce((sum, w) => sum + w.pendingCount, 0),
+        processedCount: workers.reduce((sum, w) => sum + w.processedCount, 0),
+        failedCount: workers.reduce((sum, w) => sum + w.failedCount, 0),
       };
     }
     return stats;
@@ -375,8 +456,10 @@ export class SettlementQueue implements ISettlementQueue {
    */
   async drain(): Promise<void> {
     const drainPromises: Promise<void>[] = [];
-    for (const worker of this.shardWorkers.values()) {
-      drainPromises.push(worker.drain());
+    for (const workers of this.shardWorkers.values()) {
+      for (const worker of workers) {
+        drainPromises.push(worker.drain());
+      }
     }
     await Promise.all(drainPromises);
   }
@@ -385,8 +468,10 @@ export class SettlementQueue implements ISettlementQueue {
    * Clears all pending requests from all shard queues.
    */
   clear(): void {
-    for (const worker of this.shardWorkers.values()) {
-      worker.clear();
+    for (const workers of this.shardWorkers.values()) {
+      for (const worker of workers) {
+        worker.clear();
+      }
     }
   }
 }

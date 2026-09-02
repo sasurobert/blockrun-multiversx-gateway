@@ -605,6 +605,193 @@ export class BlockRunMvxClient {
   }
 
   /**
+   * OpenAI-compatible chat completions streaming endpoint with autonomous x402 payment.
+   * Yields content deltas and returns the final payment receipt.
+   */
+  public async *chatStream(
+    model: string,
+    messages: string | ChatMessage[],
+    options?: ChatOptions
+  ): AsyncGenerator<string, { paymentReceipt?: string }> {
+    const formattedMessages: ChatMessage[] =
+      typeof messages === "string" ? [{ role: "user", content: messages }] : messages;
+
+    const reqBody = {
+      model,
+      messages: formattedMessages,
+      max_tokens: options?.max_tokens ?? options?.maxTokens ?? 1000,
+      stream: true,
+      ...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
+      ...(options ?? {}),
+    };
+
+    const url = `${this.gatewayUrl}/api/v1/chat/completions`;
+    const initialHeaders: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(options?.headers || {}),
+    };
+
+    // Step 1: Initial call
+    let res = await this.customFetch(url, {
+      method: "POST",
+      headers: initialHeaders,
+      body: JSON.stringify(reqBody),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+
+    let receipt: string | undefined;
+
+    // Step 2: If 402, negotiate payment
+    if (res.status === 402) {
+      const requirements = await this.extractPaymentRequirements(res);
+      if (!requirements) {
+        throw new PaymentError("Received HTTP 402 without parseable payment requirements");
+      }
+
+      const decimals =
+        typeof (requirements.extra as any)?.decimals === "number"
+          ? (requirements.extra as any).decimals
+          : 6;
+      let costUsd = 0;
+      try {
+        const rawAmount = BigInt(requirements.amount);
+        const divisor = 10n ** BigInt(decimals);
+        costUsd = Number(rawAmount) / Number(divisor);
+      } catch {
+        costUsd = parseInt(requirements.amount, 10) / 10 ** decimals;
+      }
+
+      if (this.maxCostPerCall !== undefined && costUsd > this.maxCostPerCall) {
+        throw new SpendLimitError(
+          `Requested call cost ($${costUsd.toFixed(6)}) exceeds maxCostPerCall limit ($${this.maxCostPerCall.toFixed(6)})`,
+          "call",
+          costUsd,
+          this.maxCostPerCall
+        );
+      }
+      if (
+        this.maxSessionCost !== undefined &&
+        this.sessionSpendUsd + costUsd > this.maxSessionCost
+      ) {
+        throw new SpendLimitError(
+          `Projected session spend ($${(this.sessionSpendUsd + costUsd).toFixed(6)}) would exceed maxSessionCost limit ($${this.maxSessionCost.toFixed(6)})`,
+          "session",
+          this.sessionSpendUsd + costUsd,
+          this.maxSessionCost
+        );
+      }
+
+      const relayerAddrStr = await this.resolveRelayerAddress();
+      const nonce = await this.getAccountNonce();
+      const chainID = chainIDFromNetwork(requirements.network || this.network);
+
+      const tx = new Transaction({
+        nonce: BigInt(nonce),
+        value: 0n,
+        sender: this.userAddress,
+        receiver: Address.newFromBech32(requirements.payTo),
+        gasPrice: 1000000000n,
+        gasLimit: 500000n,
+        data: Buffer.from(buildEsdtTransferData(requirements.asset, requirements.amount)),
+        chainID,
+        version: 2,
+        options: 0,
+        relayer: Address.newFromBech32(relayerAddrStr),
+      });
+
+      const bytesToSign = this.transactionComputer.computeBytesForSigning(tx);
+      const signatureBuffer = await this.signer.sign(bytesToSign);
+      const signatureHex = signatureBuffer.toString("hex");
+
+      const paymentPayload: X402PaymentPayload = {
+        x402Version: 2,
+        resource: {
+          url,
+          description: "AI Model Inference Payment",
+        },
+        accepted: requirements,
+        payload: {
+          nonce,
+          value: "0",
+          receiver: requirements.payTo,
+          sender: this.userAddress.toBech32(),
+          gasPrice: 1000000000,
+          gasLimit: 500000,
+          data: buildEsdtTransferData(requirements.asset, requirements.amount),
+          chainID,
+          version: 2,
+          options: 0,
+          signature: signatureHex,
+          relayer: relayerAddrStr,
+        },
+      };
+
+      const retryHeaders: Record<string, string> = {
+        ...initialHeaders,
+        "PAYMENT-SIGNATURE": encodeHeaderJson(paymentPayload),
+      };
+
+      res = await this.customFetch(url, {
+        method: "POST",
+        headers: retryHeaders,
+        body: JSON.stringify(reqBody),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+
+      this.sessionSpendUsd += costUsd;
+    }
+
+    if (res.status !== 200 && !res.ok) {
+      throw new APIError(`Stream request failed with status ${res.status}`, res.status);
+    }
+
+    receipt = this.extractReceipt(res);
+
+    // Read SSE body
+    if (res.body && typeof (res.body as any).getReader === "function") {
+      const reader = (res.body as any).getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data: ")) continue;
+          const dataStr = trimmed.slice(6);
+          if (dataStr === "[DONE]") return { paymentReceipt: receipt };
+          try {
+            const parsed = JSON.parse(dataStr);
+            const delta = parsed?.choices?.[0]?.delta?.content;
+            if (delta) yield delta;
+          } catch {}
+        }
+      }
+    } else if (typeof (res as any).text === "function") {
+      const text = await (res as any).text();
+      const lines = text.split("\n");
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("data: ")) continue;
+        const dataStr = trimmed.slice(6);
+        if (dataStr === "[DONE]") break;
+        try {
+          const parsed = JSON.parse(dataStr);
+          const delta = parsed?.choices?.[0]?.delta?.content;
+          if (delta) yield delta;
+        } catch {}
+      }
+    }
+
+    return { paymentReceipt: receipt };
+  }
+
+  /**
    * Anthropic-compatible messages endpoint with autonomous x402 payment.
    */
   public async messages(

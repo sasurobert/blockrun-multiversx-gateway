@@ -24,6 +24,8 @@
     "dev": "tsx watch src/bin/server.ts",
     "example": "tsx examples/blockrun_agent_demo.ts",
     "test": "vitest run",
+    "test:python": "PYTHONPATH=./python python3 -m unittest discover -s python/tests",
+    "test:all": "npm test && npm run test:python",
     "test:watch": "vitest"
   },
   "dependencies": {

@@ -30,9 +30,16 @@ import {
 } from "./pricing_engine.js";
 
 import { RateLimitConfig } from "../server/facilitator_server.js";
+import {
+  defaultMetricsRegistry,
+  httpRequestsTotal,
+  paymentsSettledTotal,
+  spendMicroUsdcTotal,
+} from "../server/metrics.js";
 
 export type UpstreamAiHandler = (
-  reqBody: Record<string, unknown>
+  reqBody: Record<string, unknown>,
+  signal?: AbortSignal
 ) => Promise<Record<string, unknown>>;
 
 /**
@@ -88,14 +95,13 @@ function createRateLimiter(config?: RateLimitConfig) {
     const ip = req.ip || req.socket.remoteAddress || "anonymous";
     const now = Date.now();
 
-    let record = clientRequests.get(ip);
+    const record = clientRequests.get(ip);
     if (!record || now > record.resetTime) {
-      record = { count: 1, resetTime: now + windowMs };
-      clientRequests.set(ip, record);
-    } else {
-      record.count++;
+      clientRequests.set(ip, { count: 1, resetTime: now + windowMs });
+      return next();
     }
 
+    record.count++;
     res.setHeader("X-RateLimit-Limit", maxRequests.toString());
     res.setHeader(
       "X-RateLimit-Remaining",
@@ -179,29 +185,59 @@ function generateMockAnthropicResponse(
 }
 
 /**
- * Executes a promise with an optional timeout in milliseconds.
+ * Executes an upstream AI call with timeout and AbortSignal support.
  */
 async function executeWithTimeout<T>(
-  promise: Promise<T>,
-  timeoutMs?: number
+  fnOrPromise: Promise<T> | ((signal: AbortSignal) => Promise<T>),
+  timeoutMs?: number,
+  clientSignal?: AbortSignal
 ): Promise<T> {
-  if (!timeoutMs || timeoutMs <= 0) {
-    return await promise;
+  const controller = new AbortController();
+
+  if (clientSignal) {
+    if (clientSignal.aborted) {
+      controller.abort();
+    } else {
+      clientSignal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
   }
 
   let timer: NodeJS.Timeout | undefined;
-  const timeoutPromise = new Promise<never>((_, reject) => {
+  if (timeoutMs && timeoutMs > 0) {
     timer = setTimeout(() => {
-      const err = new Error(`Upstream AI request timed out after ${timeoutMs}ms`);
-      (err as unknown as Record<string, unknown>).statusCode = 504;
-      reject(err);
+      controller.abort();
     }, timeoutMs);
     if (timer.unref) {
       timer.unref();
     }
-  });
+  }
 
   try {
+    const promise =
+      typeof fnOrPromise === "function" ? fnOrPromise(controller.signal) : fnOrPromise;
+
+    if (!timeoutMs || timeoutMs <= 0) {
+      return await promise;
+    }
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      if (controller.signal.aborted) {
+        const err = new Error(`Upstream AI request timed out after ${timeoutMs}ms`);
+        (err as unknown as Record<string, unknown>).statusCode = 504;
+        reject(err);
+        return;
+      }
+      controller.signal.addEventListener(
+        "abort",
+        () => {
+          const err = new Error(`Upstream AI request timed out after ${timeoutMs}ms`);
+          (err as unknown as Record<string, unknown>).statusCode = 504;
+          reject(err);
+        },
+        { once: true }
+      );
+    });
+
     return await Promise.race([promise, timeoutPromise]);
   } finally {
     if (timer) {
@@ -287,6 +323,18 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
   // 4. Rate Limiter
   app.use(createRateLimiter(options.rateLimit));
 
+  // 5. Telemetry Tracking
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    res.on("finish", () => {
+      httpRequestsTotal.inc({
+        method: req.method,
+        endpoint: req.route?.path || req.path,
+        status: res.statusCode.toString(),
+      });
+    });
+    next();
+  });
+
   // --- Endpoints ---
 
   /**
@@ -303,6 +351,15 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
       payTo: options.payTo,
       queueStats: options.settlementQueue?.getShardStats(),
     });
+  });
+
+  /**
+   * GET /metrics
+   * Prometheus exposition format telemetry.
+   */
+  app.get("/metrics", (_req: Request, res: Response) => {
+    res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    res.send(defaultMetricsRegistry.serialize());
   });
 
   /**
@@ -506,24 +563,72 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
         return;
       }
 
-      // Step 3: Execute AI model inference
+      // Step 3: Settle payment
+      const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
+      const settleHeaders = buildPaymentResponseHeaders(settleResult);
+      for (const [k, v] of Object.entries(settleHeaders)) {
+        res.setHeader(k, v);
+      }
+
+      const isStreaming = req.body?.stream === true;
+
+      // Step 4: Execute AI model inference
       let aiResponse: Record<string, unknown>;
       if (options.upstreamAiHandler) {
         aiResponse = await executeWithTimeout(
-          options.upstreamAiHandler(req.body),
+          (signal) => options.upstreamAiHandler!(req.body, signal),
           options.upstreamTimeoutMs
         );
       } else {
         aiResponse = generateMockOpenAIResponse(model, messages, cost);
       }
 
-      // Step 4: Settle payment
-      const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
+      if (isStreaming) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.status(200);
 
-      // Step 5: Return 200 OK with response and payment receipt headers
-      const settleHeaders = buildPaymentResponseHeaders(settleResult);
-      for (const [k, v] of Object.entries(settleHeaders)) {
-        res.setHeader(k, v);
+        const content =
+          (aiResponse?.choices as any[])?.[0]?.message?.content ??
+          aiResponse?.content ??
+          "MultiversX x402 payment settled.";
+        const words = String(content).split(" ");
+
+        for (const word of words) {
+          const chunk = {
+            id: aiResponse?.id ?? `chatcmpl-${Math.random().toString(36).substring(2, 12)}`,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model: model.id,
+            choices: [
+              {
+                index: 0,
+                delta: { content: word + " " },
+                finish_reason: null,
+              },
+            ],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+        }
+
+        const stopChunk = {
+          id: aiResponse?.id ?? `chatcmpl-${Math.random().toString(36).substring(2, 12)}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: model.id,
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+            },
+          ],
+        };
+        res.write(`data: ${JSON.stringify(stopChunk)}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
       }
 
       res.status(200).json(aiResponse);
@@ -636,24 +741,85 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
         return;
       }
 
-      // Step 3: Execute AI model inference
+      // Step 3: Settle payment
+      const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
+      const settleHeaders = buildPaymentResponseHeaders(settleResult);
+      for (const [k, v] of Object.entries(settleHeaders)) {
+        res.setHeader(k, v);
+      }
+
+      const isStreaming = req.body?.stream === true;
+
+      // Step 4: Execute AI model inference
       let aiResponse: Record<string, unknown>;
       if (options.upstreamAiHandler) {
         aiResponse = await executeWithTimeout(
-          options.upstreamAiHandler(req.body),
+          (signal) => options.upstreamAiHandler!(req.body, signal),
           options.upstreamTimeoutMs
         );
       } else {
         aiResponse = generateMockAnthropicResponse(model, normalizedMessages, cost);
       }
 
-      // Step 4: Settle payment
-      const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
+      if (isStreaming) {
+        res.setHeader("Content-Type", "text/event-stream");
+        res.setHeader("Cache-Control", "no-cache");
+        res.setHeader("Connection", "keep-alive");
+        res.status(200);
 
-      // Step 5: Return 200 OK with response and receipt headers
-      const settleHeaders = buildPaymentResponseHeaders(settleResult);
-      for (const [k, v] of Object.entries(settleHeaders)) {
-        res.setHeader(k, v);
+        const content =
+          (aiResponse?.content as any[])?.[0]?.text ??
+          aiResponse?.text ??
+          "MultiversX x402 payment settled.";
+        const words = String(content).split(" ");
+
+        res.write(
+          `event: message_start\ndata: ${JSON.stringify({
+            type: "message_start",
+            message: {
+              id: aiResponse?.id ?? `msg_${Math.random().toString(36).substring(2, 14)}`,
+              type: "message",
+              role: "assistant",
+              model: model.id,
+              content: [],
+              usage: { input_tokens: cost.inputTokens, output_tokens: 0 },
+            },
+          })}\n\n`
+        );
+        res.write(
+          `event: content_block_start\ndata: ${JSON.stringify({
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          })}\n\n`
+        );
+
+        for (const word of words) {
+          res.write(
+            `event: content_block_delta\ndata: ${JSON.stringify({
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: word + " " },
+            })}\n\n`
+          );
+        }
+
+        res.write(
+          `event: content_block_stop\ndata: ${JSON.stringify({
+            type: "content_block_stop",
+            index: 0,
+          })}\n\n`
+        );
+        res.write(
+          `event: message_delta\ndata: ${JSON.stringify({
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: cost.outputTokens },
+          })}\n\n`
+        );
+        res.write(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+        res.end();
+        return;
       }
 
       res.status(200).json(aiResponse);

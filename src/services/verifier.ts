@@ -303,20 +303,14 @@ export class VerifierService implements IVerifierService {
     // 7. Relayed V3 Verification
     if (txPayload.relayer) {
       if (this.relayerPool) {
-        let expectedRelayer: string;
-        try {
-          expectedRelayer = this.relayerPool.getRelayerAddressForUser(txPayload.sender);
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          return {
-            isValid: false,
-            errorCode: PaymentErrorCode.PAYMENT_INVALID,
-            invalidReason: `Failed to resolve relayer for sender shard: ${message}`,
-            payer: txPayload.sender,
-          };
-        }
+        const userShard = this.relayerPool.getShardForAddress(txPayload.sender);
+        const shardRelayers = this.relayerPool.getAllRelayersForShard(userShard);
+        const isRelayerInShard = shardRelayers.some(
+          (s) => s.getAddress().bech32() === txPayload.relayer
+        );
 
-        if (txPayload.relayer !== expectedRelayer) {
+        if (!isRelayerInShard) {
+          const expectedRelayer = this.relayerPool.getRelayerAddressForShard(userShard);
           return {
             isValid: false,
             errorCode: PaymentErrorCode.PAYMENT_INVALID,

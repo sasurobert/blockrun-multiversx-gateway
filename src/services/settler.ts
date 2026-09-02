@@ -181,8 +181,10 @@ export class SettlerService implements ISettlerService {
       if (txPayload.relayerSignature) {
         tx.relayerSignature = Buffer.from(txPayload.relayerSignature, "hex");
       } else if (relayerAddr && this.relayerPool) {
-        // Automatically sign with sender shard relayer key from pool
-        const relayerSigner = this.relayerPool.getRelayerForAddress(txPayload.sender);
+        // Automatically sign with designated relayer key if specified, or sender shard relayer
+        const relayerSigner =
+          this.relayerPool.getRelayerByAddress(relayerAddr) ??
+          this.relayerPool.getRelayerForAddress(txPayload.sender);
         const bytesToSign = this.transactionComputer.computeBytesForSigning(tx);
         const relayerSig = await relayerSigner.sign(bytesToSign);
         tx.relayerSignature = relayerSig;

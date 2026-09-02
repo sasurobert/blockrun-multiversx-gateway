@@ -31,7 +31,7 @@ export interface CostEstimateResult {
 
 /**
  * Estimates token count from chat messages.
- * Uses standard heuristic (~4 characters per token + per-message role overhead).
+ * Uses BPE-aware heuristic (~4 characters per ASCII token, ~1.5 characters per non-ASCII/CJK token, plus per-message role overhead).
  */
 export function estimateInputTokens(
   messages: Array<{ role?: string; content?: string }>
@@ -40,16 +40,31 @@ export function estimateInputTokens(
     return 1;
   }
 
-  let totalChars = 0;
+  let totalTokens = 0;
   for (const msg of messages) {
-    const contentLen = typeof msg.content === "string" ? msg.content.length : 0;
+    const content = typeof msg.content === "string" ? msg.content : "";
     const roleLen = typeof msg.role === "string" ? msg.role.length : 0;
-    // 4 tokens (~16 chars) overhead per message for role/separators
-    totalChars += contentLen + roleLen + 16;
+
+    // Per-message role + formatting overhead: ~4 tokens
+    totalTokens += Math.max(4, Math.ceil(roleLen / 4) + 4);
+
+    if (content.length > 0) {
+      let asciiChars = 0;
+      let nonAsciiChars = 0;
+      for (let i = 0; i < content.length; i++) {
+        const code = content.charCodeAt(i);
+        if (code <= 127) {
+          asciiChars++;
+        } else {
+          nonAsciiChars++;
+        }
+      }
+      const contentTokens = Math.ceil(asciiChars / 4) + Math.ceil(nonAsciiChars / 1.5);
+      totalTokens += Math.max(1, contentTokens);
+    }
   }
 
-  const estimated = Math.ceil(totalChars / 4);
-  return Math.max(1, estimated);
+  return Math.max(1, totalTokens);
 }
 
 /**

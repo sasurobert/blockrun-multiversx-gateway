@@ -140,4 +140,52 @@ describe("RelayerPoolManager (Multi-Shard Relayer Pool)", () => {
       expect(() => manager.getRelayerForShard(0)).toThrow("No relayer configured for shard 0");
     });
   });
+
+  describe("Multi-Relayer Rotation per Shard", () => {
+    it("should allow registering multiple relayers per shard and rotate round-robin", () => {
+      const mnemonic = Mnemonic.fromString(testMnemonic);
+      const pool = new RelayerPoolManager();
+
+      // Register two distinct relayers in shard 1
+      const signerA = new UserSigner(mnemonic.deriveKey(0));
+      const signerB = new UserSigner(mnemonic.deriveKey(15)); // another derivation
+      const addrA = signerA.getAddress().bech32();
+      const addrB = signerB.getAddress().bech32();
+
+      pool.registerRelayer(1, signerA);
+      pool.registerRelayer(1, signerB);
+
+      const relayersInShard1 = pool.getAllRelayersForShard(1);
+      expect(relayersInShard1.length).toBe(2);
+
+      // Round robin calls alternate between signerA and signerB
+      const first = pool.getNextRelayerForShard(1);
+      const second = pool.getNextRelayerForShard(1);
+      const third = pool.getNextRelayerForShard(1);
+
+      expect([addrA, addrB]).toContain(first.getAddress().bech32());
+      expect([addrA, addrB]).toContain(second.getAddress().bech32());
+      expect(first.getAddress().bech32()).not.toBe(second.getAddress().bech32());
+      expect(third.getAddress().bech32()).toBe(first.getAddress().bech32());
+    });
+
+    it("should check if an address belongs to the relayer pool via isConfiguredRelayer", () => {
+      const manager = RelayerPoolManager.fromMnemonic(testMnemonic);
+      expect(manager.isConfiguredRelayer(sampleShard0Address)).toBe(true);
+      expect(manager.isConfiguredRelayer(sampleShard1Address)).toBe(true);
+      expect(manager.isConfiguredRelayer("erd1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gq4hu")).toBe(false);
+    });
+
+    it("should support relayersPerShard parameter in fromMnemonic", () => {
+      const pool = RelayerPoolManager.fromMnemonic(testMnemonic, {
+        relayersPerShard: 2,
+        shardsToCover: [0, 1, 2],
+        maxScanIndex: 60,
+      });
+
+      expect(pool.getAllRelayersForShard(0).length).toBeGreaterThanOrEqual(2);
+      expect(pool.getAllRelayersForShard(1).length).toBeGreaterThanOrEqual(2);
+      expect(pool.getAllRelayersForShard(2).length).toBeGreaterThanOrEqual(2);
+    });
+  });
 });

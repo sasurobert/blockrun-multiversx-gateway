@@ -12,28 +12,39 @@ export const METACHAIN_SHARD_ID = 4294967295;
 export interface MnemonicRelayerOptions {
   maxScanIndex?: number;
   shardsToCover?: number[];
+  relayersPerShard?: number;
 }
 
 /**
  * Multi-Shard Relayer Pool Manager.
- * Computes shard IDs for user addresses and manages relayer signers across shards (0, 1, 2, Metachain).
+ * Computes shard IDs for user addresses and manages relayer signers across shards (0, 1, 2, Metachain)
+ * with support for multiple rotated relayers per shard to maximize throughput.
  */
 export class RelayerPoolManager {
   private readonly addressComputer: AddressComputer;
-  private readonly relayers: Map<number, UserSigner>;
+  private readonly shardRelayers: Map<number, UserSigner[]>;
+  private readonly roundRobinIndex: Map<number, number>;
 
-  constructor(relayers?: Map<number, UserSigner> | Record<number, UserSigner>) {
+  constructor(relayers?: Map<number, UserSigner | UserSigner[]> | Record<number, UserSigner | UserSigner[]>) {
     this.addressComputer = new AddressComputer();
-    this.relayers = new Map<number, UserSigner>();
+    this.shardRelayers = new Map<number, UserSigner[]>();
+    this.roundRobinIndex = new Map<number, number>();
 
     if (relayers) {
       if (relayers instanceof Map) {
-        for (const [shard, signer] of relayers.entries()) {
-          this.relayers.set(shard, signer);
+        for (const [shard, signerOrList] of relayers.entries()) {
+          const list = Array.isArray(signerOrList) ? signerOrList : [signerOrList];
+          for (const s of list) {
+            this.registerRelayer(shard, s);
+          }
         }
       } else {
-        for (const [shardStr, signer] of Object.entries(relayers)) {
-          this.relayers.set(Number(shardStr), signer);
+        for (const [shardStr, signerOrList] of Object.entries(relayers)) {
+          const shard = Number(shardStr);
+          const list = Array.isArray(signerOrList) ? signerOrList : [signerOrList];
+          for (const s of list) {
+            this.registerRelayer(shard, s);
+          }
         }
       }
     }
@@ -51,7 +62,13 @@ export class RelayerPoolManager {
    * Registers a relayer signer for a specific shard.
    */
   registerRelayer(shard: number, signer: UserSigner): void {
-    this.relayers.set(shard, signer);
+    const list = this.shardRelayers.get(shard) || [];
+    const signerAddr = signer.getAddress().bech32();
+    // Avoid duplicate registration of the same relayer address
+    if (!list.some((s) => s.getAddress().bech32() === signerAddr)) {
+      list.push(signer);
+      this.shardRelayers.set(shard, list);
+    }
   }
 
   /**
@@ -59,7 +76,7 @@ export class RelayerPoolManager {
    */
   registerRelayerAuto(signer: UserSigner): number {
     const shard = this.getShardForAddress(signer.getAddress().bech32());
-    this.relayers.set(shard, signer);
+    this.registerRelayer(shard, signer);
     return shard;
   }
 
@@ -67,22 +84,44 @@ export class RelayerPoolManager {
    * Checks if a relayer is registered for the specified shard.
    */
   hasShard(shard: number): boolean {
-    return this.relayers.has(shard);
+    return (this.shardRelayers.get(shard)?.length ?? 0) > 0;
   }
 
   /**
-   * Returns the UserSigner for the given shard.
+   * Returns the primary (first) UserSigner for the given shard.
    */
   getRelayerForShard(shard: number): UserSigner {
-    const relayer = this.relayers.get(shard);
-    if (!relayer) {
+    const list = this.shardRelayers.get(shard);
+    if (!list || list.length === 0) {
       throw new Error(`No relayer configured for shard ${shard}`);
     }
-    return relayer;
+    return list[0];
   }
 
   /**
-   * Returns the bech32 address for the given shard relayer.
+   * Returns the next UserSigner for the given shard using round-robin rotation.
+   */
+  getNextRelayerForShard(shard: number): UserSigner {
+    const list = this.shardRelayers.get(shard);
+    if (!list || list.length === 0) {
+      throw new Error(`No relayer configured for shard ${shard}`);
+    }
+
+    const currentIndex = this.roundRobinIndex.get(shard) ?? 0;
+    const selected = list[currentIndex % list.length];
+    this.roundRobinIndex.set(shard, currentIndex + 1);
+    return selected;
+  }
+
+  /**
+   * Returns all registered relayer UserSigners for the given shard.
+   */
+  getAllRelayersForShard(shard: number): UserSigner[] {
+    return [...(this.shardRelayers.get(shard) || [])];
+  }
+
+  /**
+   * Returns the primary bech32 address for the given shard relayer.
    */
   getRelayerAddressForShard(shard: number): string {
     const relayer = this.getRelayerForShard(shard);
@@ -90,15 +129,23 @@ export class RelayerPoolManager {
   }
 
   /**
-   * Computes the shard of the given user address and returns the matching relayer UserSigner.
+   * Returns the next bech32 address for the given shard using round-robin rotation.
    */
-  getRelayerForAddress(userAddress: string | Address): UserSigner {
-    const shard = this.getShardForAddress(userAddress);
-    return this.getRelayerForShard(shard);
+  getNextRelayerAddressForShard(shard: number): string {
+    const relayer = this.getNextRelayerForShard(shard);
+    return relayer.getAddress().bech32();
   }
 
   /**
-   * Computes the shard of the given user address and returns the matching relayer bech32 address.
+   * Computes the shard of the given user address and returns a matching relayer UserSigner (round-robin).
+   */
+  getRelayerForAddress(userAddress: string | Address): UserSigner {
+    const shard = this.getShardForAddress(userAddress);
+    return this.getNextRelayerForShard(shard);
+  }
+
+  /**
+   * Computes the shard of the given user address and returns a matching relayer bech32 address.
    */
   getRelayerAddressForUser(userAddress: string | Address): string {
     const relayer = this.getRelayerForAddress(userAddress);
@@ -106,19 +153,73 @@ export class RelayerPoolManager {
   }
 
   /**
-   * Returns a map of all registered relayers by shard.
+   * Computes the shard of the given user address and returns the next rotated relayer bech32 address.
    */
-  getAllRelayers(): Map<number, UserSigner> {
-    return new Map(this.relayers);
+  getNextRelayerAddressForUser(userAddress: string | Address): string {
+    return this.getRelayerAddressForUser(userAddress);
   }
 
   /**
-   * Returns a record of shard ID to relayer bech32 address.
+   * Checks if a given address matches any configured relayer address across all shards.
+   */
+  isConfiguredRelayer(address: string | Address): boolean {
+    return this.getRelayerByAddress(address) !== undefined;
+  }
+
+  /**
+   * Finds and returns a configured UserSigner matching the given relayer address.
+   */
+  getRelayerByAddress(address: string | Address): UserSigner | undefined {
+    const target =
+      typeof address === "string"
+        ? address
+        : typeof (address as any).toBech32 === "function"
+        ? (address as any).toBech32()
+        : typeof (address as any).bech32 === "function"
+        ? (address as any).bech32()
+        : String(address);
+    for (const list of this.shardRelayers.values()) {
+      const match = list.find((s) => s.getAddress().bech32() === target);
+      if (match) {
+        return match;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Returns a map of all primary registered relayers by shard.
+   */
+  getAllRelayers(): Map<number, UserSigner> {
+    const result = new Map<number, UserSigner>();
+    for (const [shard, list] of this.shardRelayers.entries()) {
+      if (list.length > 0) {
+        result.set(shard, list[0]);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Returns a record of shard ID to primary relayer bech32 address.
    */
   getAllRelayerAddresses(): Record<number, string> {
     const result: Record<number, string> = {};
-    for (const [shard, signer] of this.relayers.entries()) {
-      result[shard] = signer.getAddress().bech32();
+    for (const [shard, list] of this.shardRelayers.entries()) {
+      if (list.length > 0) {
+        result[shard] = list[0].getAddress().bech32();
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Returns a record of shard ID to all relayer bech32 addresses.
+   */
+  getAllRelayerAddressesMulti(): Record<number, string[]> {
+    const result: Record<number, string[]> = {};
+    for (const [shard, list] of this.shardRelayers.entries()) {
+      result[shard] = list.map((s) => s.getAddress().bech32());
     }
     return result;
   }
@@ -130,6 +231,7 @@ export class RelayerPoolManager {
     const mnemonic = Mnemonic.fromString(mnemonicStr.trim());
     const maxScanIndex = options?.maxScanIndex ?? 100;
     const targetShards = new Set<number>(options?.shardsToCover ?? [0, 1, 2]);
+    const relayersPerShard = Math.max(1, options?.relayersPerShard ?? 1);
 
     const pool = new RelayerPoolManager();
     const ac = new AddressComputer();
@@ -140,12 +242,17 @@ export class RelayerPoolManager {
       const addr = Address.newFromBech32(pub.toAddress().bech32());
       const shard = ac.getShardOfAddress(addr);
 
-      if (targetShards.has(shard) && !pool.hasShard(shard)) {
-        pool.registerRelayer(shard, new UserSigner(secret));
+      if (targetShards.has(shard)) {
+        const count = pool.getAllRelayersForShard(shard).length;
+        if (count < relayersPerShard) {
+          pool.registerRelayer(shard, new UserSigner(secret));
+        }
       }
 
-      // Check if all requested shards are satisfied
-      const allFilled = Array.from(targetShards).every((s) => pool.hasShard(s));
+      // Check if all requested shards have enough relayers
+      const allFilled = Array.from(targetShards).every(
+        (s) => pool.getAllRelayersForShard(s).length >= relayersPerShard
+      );
       if (allFilled) {
         break;
       }

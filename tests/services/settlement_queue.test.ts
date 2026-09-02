@@ -420,4 +420,92 @@ describe("SettlementQueue (High-Throughput Shard-Partitioned Queue)", () => {
     expect(queue.getPendingCount()).toBe(0);
     expect(finishCount).toBe(4);
   });
+
+  it("10. should reject with 503 error when maxQueueSize backpressure limit is exceeded", async () => {
+    const mockSettler: ISettlerService = {
+      settle: async (req: SettleRequest): Promise<SettleResponse> => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return {
+          success: true,
+          transaction: "0xhash",
+          network: req.paymentRequirements.network,
+        };
+      },
+      getSettlement: async () => null,
+    };
+
+    const queue = new SettlementQueue({
+      settler: mockSettler,
+      relayerPool,
+      maxQueueSize: 2, // only allow 2 queued items
+    });
+
+    const reqs = await Promise.all([
+      createSettleRequest({ nonce: 0n }),
+      createSettleRequest({ nonce: 1n }),
+      createSettleRequest({ nonce: 2n }),
+      createSettleRequest({ nonce: 3n }),
+    ]);
+
+    // First two should succeed or enqueue
+    const p1 = queue.enqueue(reqs[0]);
+    const p2 = queue.enqueue(reqs[1]);
+
+    // Third should be rejected by backpressure
+    const res3 = await queue.enqueue(reqs[2]);
+    expect(res3.success).toBe(false);
+    expect(res3.errorCode).toBe(PaymentErrorCode.PAYMENT_INVALID);
+    expect(res3.errorReason).toContain("saturated");
+
+    await Promise.all([p1, p2]);
+    await queue.drain();
+  });
+
+  it("11. should execute settlements in parallel across multiple relayers within the same shard", async () => {
+    // Configure relayer pool with 2 relayers in shard 1
+    const multiRelayerPool = new RelayerPoolManager();
+    const relayerSigner1 = new UserSigner(userMnemonic.deriveKey(10));
+    const relayerSigner2 = new UserSigner(userMnemonic.deriveKey(20));
+    const shard = multiRelayerPool.getShardForAddress(userAddress);
+
+    multiRelayerPool.registerRelayer(shard, relayerSigner1);
+    multiRelayerPool.registerRelayer(shard, relayerSigner2);
+
+    let activeConcurrentSettlements = 0;
+    let maxObservedConcurrent = 0;
+
+    const mockSettler: ISettlerService = {
+      settle: async (req: SettleRequest): Promise<SettleResponse> => {
+        activeConcurrentSettlements++;
+        maxObservedConcurrent = Math.max(maxObservedConcurrent, activeConcurrentSettlements);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        activeConcurrentSettlements--;
+        return {
+          success: true,
+          transaction: "0xhash-multi",
+          network: req.paymentRequirements.network,
+        };
+      },
+      getSettlement: async () => null,
+    };
+
+    const queue = new SettlementQueue({
+      settler: mockSettler,
+      relayerPool: multiRelayerPool,
+    });
+
+    const reqs = await Promise.all([
+      createSettleRequest({ nonce: 0n }),
+      createSettleRequest({ nonce: 1n }),
+      createSettleRequest({ nonce: 2n }),
+      createSettleRequest({ nonce: 3n }),
+    ]);
+
+    const results = await Promise.all(reqs.map((r) => queue.enqueue(r)));
+    expect(results.every((r) => r.success)).toBe(true);
+    // Because 2 relayers are available for this shard, concurrency should reach 2
+    expect(maxObservedConcurrent).toBeGreaterThanOrEqual(2);
+
+    await queue.drain();
+  });
 });

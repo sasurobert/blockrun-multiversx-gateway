@@ -250,6 +250,64 @@ describe("BlockRunMvxClient SDK", () => {
       expect(res.paymentReceipt).toBe("tx-anthropic-receipt");
       expect(client.getSessionSpend()).toBeCloseTo(0.003, 6);
     });
+
+    it("should stream chat completion chunks via chatStream", async () => {
+      const requirements: PaymentRequirements = {
+        scheme: "exact",
+        network: "multiversx:1",
+        amount: "1000",
+        asset: "USDC-c76f1f",
+        payTo: merchantAddress.toBech32(),
+        maxTimeoutSeconds: 300,
+      };
+
+      const challengeBody = {
+        x402Version: 2,
+        accepts: [requirements],
+      };
+
+      const sseText =
+        'data: {"choices":[{"delta":{"content":"Hello "}}]}\n\n' +
+        'data: {"choices":[{"delta":{"content":"World!"}}]}\n\n' +
+        "data: [DONE]\n\n";
+
+      let callCount = 0;
+      const customFetch = vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount === 1) {
+          return {
+            status: 402,
+            ok: false,
+            headers: new Headers({ "PAYMENT-REQUIRED": encodeHeaderJson(challengeBody) }),
+            json: async () => challengeBody,
+          };
+        }
+        return {
+          status: 200,
+          ok: true,
+          headers: new Headers({
+            "content-type": "text/event-stream",
+            "x-payment-receipt": "tx-stream-receipt-123",
+          }),
+          text: async () => sseText,
+        };
+      });
+
+      const client = new BlockRunMvxClient({
+        signer: agentSigner,
+        fetch: customFetch,
+        networkProvider: mockNetworkProvider,
+        relayerAddress: relayerAddress.toBech32(),
+      });
+
+      const chunks: string[] = [];
+      const stream = client.chatStream("openai/gpt-5.4", "Hi streaming");
+      for await (const chunk of stream) {
+        chunks.push(chunk);
+      }
+
+      expect(chunks).toEqual(["Hello ", "World!"]);
+    });
   });
 
   describe("Spend Limits Protection", () => {
