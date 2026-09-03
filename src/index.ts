@@ -18,5 +18,7 @@ export * from "./server/metrics.js";
 export * from "./gateway/model_catalog.js";
 export * from "./gateway/pricing_engine.js";
 export * from "./gateway/blockrun_gateway.js";
+export * from "./services/fleet_service.js";
+export * from "./gateway/gemini_provider.js";
 export * from "./client/errors.js";
 export * from "./client/blockrun_mvx_client.js";

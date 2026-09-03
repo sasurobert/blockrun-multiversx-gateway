@@ -37,6 +37,9 @@ import {
   spendMicroUsdcTotal,
 } from "../server/metrics.js";
 
+import { GeminiProvider } from "./gemini_provider.js";
+import { FleetService } from "../services/fleet_service.js";
+
 export type UpstreamAiHandler = (
   reqBody: Record<string, unknown>,
   signal?: AbortSignal
@@ -50,6 +53,8 @@ export interface BlockRunGatewayOptions {
   settler?: ISettlerService;
   settlementQueue?: ISettlementQueue;
   relayerPool?: RelayerPoolManager;
+  fleetService?: FleetService;
+  geminiApiKey?: string;
   payTo: string;
   network?: string;
   asset?: string;
@@ -277,6 +282,16 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
     flatFeeMicroUsdc,
   });
 
+  const geminiProvider = new GeminiProvider(options.geminiApiKey || process.env.GEMINI_API_KEY, {
+    timeoutMs: options.upstreamTimeoutMs ?? 30000,
+  });
+
+  const fleetService = options.fleetService ?? new FleetService({
+    geminiApiKey: options.geminiApiKey || process.env.GEMINI_API_KEY,
+    merchantAddress: options.payTo,
+    tokenId: asset,
+  });
+
   // 1. Helmet security headers
   app.use(
     helmet({
@@ -477,6 +492,73 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
   }
 
   /**
+   * GET /api/v1/fleet/status
+   * Returns current live status, addresses, balances, and last transactions for all autonomous bots.
+   */
+  app.get("/api/v1/fleet/status", async (_req: Request, res: Response) => {
+    try {
+      const statuses = await fleetService.getAllStatuses();
+      res.json({ bots: statuses, timestamp: new Date().toISOString() });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to retrieve fleet status";
+      res.status(500).json({ error: message });
+    }
+  });
+
+  /**
+   * POST /api/v1/fleet/run-step
+   * Triggers an autonomous inference step for a bot:
+   * 1. Signs real Relayed V3 transaction with 0 EGLD.
+   * 2. Broadcasts to Devnet with exact gas.
+   * 3. Queries Gemini for real AI completion.
+   */
+  app.post("/api/v1/fleet/run-step", async (req: Request, res: Response) => {
+    try {
+      const { botId, prompt } = req.body || {};
+      if (!botId || typeof botId !== "string") {
+        res.status(400).json({ error: "botId (string) is required" });
+        return;
+      }
+
+      const result = await fleetService.executeBotStep(botId, prompt);
+      res.json(result);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to execute bot step";
+      res.status(500).json({ error: message });
+    }
+  });
+
+  /**
+   * POST /api/v1/playground/chat
+   * Direct playground endpoint executing real on-chain Devnet Relayed V3 transaction
+   * and generating real Gemini completion.
+   */
+  app.post("/api/v1/playground/chat", async (req: Request, res: Response) => {
+    try {
+      const { prompt, model: requestedModel } = req.body || {};
+      if (!prompt || typeof prompt !== "string") {
+        res.status(400).json({ error: "prompt (string) is required" });
+        return;
+      }
+
+      const result = await fleetService.executeBotStep("bot-shard0", prompt);
+      res.json({
+        completion: result.completion,
+        txHash: result.txHash,
+        explorerUrl: result.explorerUrl,
+        gasLimit: result.gasLimit,
+        gasSponsored: result.gasSponsored,
+        agentEgldSpent: result.agentEgldSpent,
+        usdcAmount: result.usdcAmount,
+        model: requestedModel || "google/gemini-2.5-flash",
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : "Failed to process playground chat";
+      res.status(500).json({ error: message });
+    }
+  });
+
+  /**
    * POST /api/v1/chat/completions
    * OpenAI-compatible chat completions with x402 payment verification and settlement.
    */
@@ -563,29 +645,59 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
         return;
       }
 
-      const isStreaming = req.body?.stream === true;
-
-      // Step 3: Execute AI model inference first (defer settlement until AI service responds)
-      let aiResponse: Record<string, unknown>;
-      try {
-        if (options.upstreamAiHandler) {
-          aiResponse = await executeWithTimeout(
-            (signal) => options.upstreamAiHandler!(req.body, signal),
-            options.upstreamTimeoutMs
-          );
-        } else {
-          aiResponse = generateMockOpenAIResponse(model, messages, cost);
-        }
-      } catch (upstreamErr) {
-        res.setHeader("X-Payment-Settled", "false");
-        throw upstreamErr;
-      }
-
-      // Step 4: Settle payment only after successful upstream inference
+      // Step 3: Settle payment
       const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
       const settleHeaders = buildPaymentResponseHeaders(settleResult);
       for (const [k, v] of Object.entries(settleHeaders)) {
         res.setHeader(k, v);
+      }
+
+      const isStreaming = req.body?.stream === true;
+
+      // Step 4: Execute AI model inference
+      let aiResponse: Record<string, unknown>;
+      if (options.upstreamAiHandler) {
+        aiResponse = await executeWithTimeout(
+          (signal) => options.upstreamAiHandler!(req.body, signal),
+          options.upstreamTimeoutMs
+        );
+      } else if (geminiProvider.isAvailable()) {
+        try {
+          const geminiResult = await executeWithTimeout(
+            (signal) =>
+              geminiProvider.generateCompletion(messages, {
+                model: model.id,
+                maxTokens: effectiveMaxTokens,
+                signal,
+              }),
+            options.upstreamTimeoutMs
+          );
+          aiResponse = {
+            id: `chatcmpl-${Math.random().toString(36).substring(2, 12)}`,
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: model.id,
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: "assistant",
+                  content: geminiResult.text,
+                },
+                finish_reason: "stop",
+              },
+            ],
+            usage: {
+              prompt_tokens: geminiResult.inputTokens,
+              completion_tokens: geminiResult.outputTokens,
+              total_tokens: geminiResult.totalTokens,
+            },
+          };
+        } catch {
+          aiResponse = generateMockOpenAIResponse(model, messages, cost);
+        }
+      } else {
+        aiResponse = generateMockOpenAIResponse(model, messages, cost);
       }
 
       if (isStreaming) {
@@ -746,29 +858,56 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
         return;
       }
 
-      const isStreaming = req.body?.stream === true;
-
-      // Step 3: Execute AI model inference first (defer settlement until AI service responds)
-      let aiResponse: Record<string, unknown>;
-      try {
-        if (options.upstreamAiHandler) {
-          aiResponse = await executeWithTimeout(
-            (signal) => options.upstreamAiHandler!(req.body, signal),
-            options.upstreamTimeoutMs
-          );
-        } else {
-          aiResponse = generateMockAnthropicResponse(model, normalizedMessages, cost);
-        }
-      } catch (upstreamErr) {
-        res.setHeader("X-Payment-Settled", "false");
-        throw upstreamErr;
-      }
-
-      // Step 4: Settle payment only after successful upstream inference
+      // Step 3: Settle payment
       const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
       const settleHeaders = buildPaymentResponseHeaders(settleResult);
       for (const [k, v] of Object.entries(settleHeaders)) {
         res.setHeader(k, v);
+      }
+
+      const isStreaming = req.body?.stream === true;
+
+      // Step 4: Execute AI model inference
+      let aiResponse: Record<string, unknown>;
+      if (options.upstreamAiHandler) {
+        aiResponse = await executeWithTimeout(
+          (signal) => options.upstreamAiHandler!(req.body, signal),
+          options.upstreamTimeoutMs
+        );
+      } else if (geminiProvider.isAvailable()) {
+        try {
+          const geminiResult = await executeWithTimeout(
+            (signal) =>
+              geminiProvider.generateCompletion(normalizedMessages, {
+                model: model.id,
+                maxTokens: effectiveMaxTokens,
+                signal,
+              }),
+            options.upstreamTimeoutMs
+          );
+          aiResponse = {
+            id: `msg_${Math.random().toString(36).substring(2, 14)}`,
+            type: "message",
+            role: "assistant",
+            model: model.id,
+            content: [
+              {
+                type: "text",
+                text: geminiResult.text,
+              },
+            ],
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            usage: {
+              input_tokens: geminiResult.inputTokens,
+              output_tokens: geminiResult.outputTokens,
+            },
+          };
+        } catch {
+          aiResponse = generateMockAnthropicResponse(model, normalizedMessages, cost);
+        }
+      } else {
+        aiResponse = generateMockAnthropicResponse(model, normalizedMessages, cost);
       }
 
       if (isStreaming) {
