@@ -503,7 +503,9 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         }),
       });
 
-      const customServer = customApp.listen(0, "127.0.0.1");
+      const customServer = await new Promise<any>((resolve) => {
+        const s = customApp.listen(0, "127.0.0.1", () => resolve(s));
+      });
       try {
         const reqBody = {
           model: "openai/gpt-5.4",
@@ -540,7 +542,9 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         },
       });
 
-      const slowServer = slowApp.listen(0, "127.0.0.1");
+      const slowServer = await new Promise<any>((resolve) => {
+        const s = slowApp.listen(0, "127.0.0.1", () => resolve(s));
+      });
       try {
         const reqBody = {
           model: "openai/gpt-5.4",
@@ -571,7 +575,9 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         rateLimit: { windowMs: 10000, max: 2, enabled: true },
       });
 
-      const rlServer = rateLimitedApp.listen(0, "127.0.0.1");
+      const rlServer = await new Promise<any>((resolve) => {
+        const s = rateLimitedApp.listen(0, "127.0.0.1", () => resolve(s));
+      });
       try {
         const res1 = await request(rlServer).get("/health");
         expect(res1.status).toBe(200);
@@ -652,7 +658,9 @@ describe("BlockRun AI Gateway Proxy Server", () => {
         },
       });
 
-      const abortServer = abortableApp.listen(0, "127.0.0.1");
+      const abortServer = await new Promise<any>((resolve) => {
+        const s = abortableApp.listen(0, "127.0.0.1", () => resolve(s));
+      });
       try {
         const reqBody = {
           model: "openai/gpt-5.4",

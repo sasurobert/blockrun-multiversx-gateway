@@ -563,24 +563,29 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
         return;
       }
 
-      // Step 3: Settle payment
+      const isStreaming = req.body?.stream === true;
+
+      // Step 3: Execute AI model inference first (defer settlement until AI service responds)
+      let aiResponse: Record<string, unknown>;
+      try {
+        if (options.upstreamAiHandler) {
+          aiResponse = await executeWithTimeout(
+            (signal) => options.upstreamAiHandler!(req.body, signal),
+            options.upstreamTimeoutMs
+          );
+        } else {
+          aiResponse = generateMockOpenAIResponse(model, messages, cost);
+        }
+      } catch (upstreamErr) {
+        res.setHeader("X-Payment-Settled", "false");
+        throw upstreamErr;
+      }
+
+      // Step 4: Settle payment only after successful upstream inference
       const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
       const settleHeaders = buildPaymentResponseHeaders(settleResult);
       for (const [k, v] of Object.entries(settleHeaders)) {
         res.setHeader(k, v);
-      }
-
-      const isStreaming = req.body?.stream === true;
-
-      // Step 4: Execute AI model inference
-      let aiResponse: Record<string, unknown>;
-      if (options.upstreamAiHandler) {
-        aiResponse = await executeWithTimeout(
-          (signal) => options.upstreamAiHandler!(req.body, signal),
-          options.upstreamTimeoutMs
-        );
-      } else {
-        aiResponse = generateMockOpenAIResponse(model, messages, cost);
       }
 
       if (isStreaming) {
@@ -741,24 +746,29 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
         return;
       }
 
-      // Step 3: Settle payment
+      const isStreaming = req.body?.stream === true;
+
+      // Step 3: Execute AI model inference first (defer settlement until AI service responds)
+      let aiResponse: Record<string, unknown>;
+      try {
+        if (options.upstreamAiHandler) {
+          aiResponse = await executeWithTimeout(
+            (signal) => options.upstreamAiHandler!(req.body, signal),
+            options.upstreamTimeoutMs
+          );
+        } else {
+          aiResponse = generateMockAnthropicResponse(model, normalizedMessages, cost);
+        }
+      } catch (upstreamErr) {
+        res.setHeader("X-Payment-Settled", "false");
+        throw upstreamErr;
+      }
+
+      // Step 4: Settle payment only after successful upstream inference
       const settleResult = await executeSettlement(paymentPayload, paymentRequirements);
       const settleHeaders = buildPaymentResponseHeaders(settleResult);
       for (const [k, v] of Object.entries(settleHeaders)) {
         res.setHeader(k, v);
-      }
-
-      const isStreaming = req.body?.stream === true;
-
-      // Step 4: Execute AI model inference
-      let aiResponse: Record<string, unknown>;
-      if (options.upstreamAiHandler) {
-        aiResponse = await executeWithTimeout(
-          (signal) => options.upstreamAiHandler!(req.body, signal),
-          options.upstreamTimeoutMs
-        );
-      } else {
-        aiResponse = generateMockAnthropicResponse(model, normalizedMessages, cost);
       }
 
       if (isStreaming) {
