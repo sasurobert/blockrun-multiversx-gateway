@@ -9,6 +9,7 @@ export * from "./services/verifier.js";
 export * from "./services/settler.js";
 export * from "./services/settlement_queue.js";
 export * from "./services/treasury_service.js";
+export * from "./services/gas_calculator.js";
 export * from "./utils/data_parser.js";
 export * from "./utils/header_utils.js";
 export * from "./server/facilitator_server.js";

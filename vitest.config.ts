@@ -6,12 +6,7 @@ export default defineConfig({
     environment: "node",
     include: ["tests/**/*.test.ts"],
     fileParallelism: false,
-    pool: "threads",
-    poolOptions: {
-      threads: {
-        singleThread: true,
-      },
-    },
+    pool: "forks",
     coverage: {
       provider: "v8",
       reporter: ["text", "json", "html"],

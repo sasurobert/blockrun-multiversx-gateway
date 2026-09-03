@@ -7,6 +7,7 @@ import {
 } from "../domain/types.js";
 import { INetworkProvider } from "../domain/network.js";
 import { buildEsdtTransferData } from "../utils/data_parser.js";
+import { MultiversXGasCalculator } from "../services/gas_calculator.js";
 import {
   decodeHeaderJson,
   encodeHeaderJson,
@@ -336,14 +337,21 @@ export class BlockRunMvxClient {
       const nonce = await this.getAccountNonce();
       const chainID = chainIDFromNetwork(requirement.network || this.network);
 
-      // Step 6: Construct and sign Relayed V3 Transaction
+      // Step 6: Construct and sign Relayed V3 Transaction with exact gas calculation
+      const calculatedGas = MultiversXGasCalculator.forEsdtTransfer(
+        requirement.asset,
+        requirement.amount,
+        true
+      );
+      const exactGasLimit = calculatedGas.gasLimit;
+
       const tx = new Transaction({
         nonce: BigInt(nonce),
         value: 0n,
         sender: this.userAddress,
         receiver: Address.newFromBech32(requirement.payTo),
         gasPrice: 1000000000n,
-        gasLimit: 500000n,
+        gasLimit: exactGasLimit,
         data: Buffer.from(buildEsdtTransferData(requirement.asset, requirement.amount)),
         chainID,
         version: 2,
@@ -368,7 +376,7 @@ export class BlockRunMvxClient {
           receiver: requirement.payTo,
           sender: this.userAddress.toBech32(),
           gasPrice: 1000000000,
-          gasLimit: 500000,
+          gasLimit: Number(exactGasLimit),
           data: buildEsdtTransferData(requirement.asset, requirement.amount),
           chainID,
           version: 2,
@@ -685,13 +693,20 @@ export class BlockRunMvxClient {
       const nonce = await this.getAccountNonce();
       const chainID = chainIDFromNetwork(requirements.network || this.network);
 
+      const calculatedGas = MultiversXGasCalculator.forEsdtTransfer(
+        requirements.asset,
+        requirements.amount,
+        true
+      );
+      const exactGasLimit = calculatedGas.gasLimit;
+
       const tx = new Transaction({
         nonce: BigInt(nonce),
         value: 0n,
         sender: this.userAddress,
         receiver: Address.newFromBech32(requirements.payTo),
         gasPrice: 1000000000n,
-        gasLimit: 500000n,
+        gasLimit: exactGasLimit,
         data: Buffer.from(buildEsdtTransferData(requirements.asset, requirements.amount)),
         chainID,
         version: 2,
@@ -716,7 +731,7 @@ export class BlockRunMvxClient {
           receiver: requirements.payTo,
           sender: this.userAddress.toBech32(),
           gasPrice: 1000000000,
-          gasLimit: 500000,
+          gasLimit: Number(exactGasLimit),
           data: buildEsdtTransferData(requirements.asset, requirements.amount),
           chainID,
           version: 2,
