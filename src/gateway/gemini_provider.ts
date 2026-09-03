@@ -27,7 +27,7 @@ export class GeminiProvider {
 
   constructor(apiKey?: string, options?: { defaultModel?: string; timeoutMs?: number }) {
     this.apiKey = apiKey || process.env.GEMINI_API_KEY || "";
-    this.defaultModel = options?.defaultModel || "gemini-2.5-flash";
+    this.defaultModel = options?.defaultModel || "gemini-2.5-flash-lite";
     this.timeoutMs = options?.timeoutMs || 30000;
   }
 

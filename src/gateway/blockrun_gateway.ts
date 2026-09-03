@@ -550,7 +550,7 @@ export function createBlockRunGateway(options: BlockRunGatewayOptions): Express 
         gasSponsored: result.gasSponsored,
         agentEgldSpent: result.agentEgldSpent,
         usdcAmount: result.usdcAmount,
-        model: requestedModel || "google/gemini-2.5-flash",
+        model: requestedModel || "google/gemini-2.5-flash-lite",
       });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Failed to process playground chat";
