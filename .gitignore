@@ -33,3 +33,8 @@ coverage/
 *.njsproj
 *.sln
 *.sw?
+
+# Keys and Wallets (CRITICAL: NEVER COMMIT)
+*.pem
+wallets/
+keys/
